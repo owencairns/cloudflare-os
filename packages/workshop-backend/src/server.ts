@@ -1,10 +1,11 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, AgentScope, SessionAuthInfo, FULL_SCOPES, hasScope, createScopeError } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
+import { parseCredential } from "./auth/credentials.js";
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { getUsageInfo } from "./ai-gateway-billing/limits/usage-checker.js";
 import { listConnectedAccounts, selectAccount } from "./ai-gateway-billing/cloudflare/connection-service.js";
@@ -76,7 +77,10 @@ type Env = Cloudflare.Env & {
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: (reason: Error) => void) {
+      private abortSession: (reason: Error) => void,
+      // What the credential that opened this session is allowed to do. A browser session reports
+      // FULL_SCOPES, so the checks below read the same for both kinds.
+      private session: SessionAuthInfo = { kind: "browser", scopes: FULL_SCOPES }) {
     super();
 
     this.#userId = userId;
@@ -95,6 +99,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // have to worry about detecting when a stub has become broken.
   get #user(): DurableObjectStub<UserDurableObject> {
     return wrapDoStubForTelemetry(this.users.get(this.#userId));
+  }
+
+  // Throws unless this session holds `scope`. Called only at the seams where a capability is handed
+  // out (see the scope table on `AgentScope`) -- never sprinkled across individual methods.
+  #requireScope(scope: AgentScope, what: string): void {
+    if (!hasScope(this.session, scope)) throw createScopeError(scope, what);
   }
 
   #isAdmin(): boolean {
@@ -216,6 +226,14 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async #openGadgetInternal(id: string, shareKey?: string,
                             configureObservers?: RpcStub<ObserverConfigCallback>)
       : Promise<NativeRpcStub<Overseer>> {
+    // Opening a workspace is the seam that hands out the Overseer -- the capability that carries
+    // essentially everything a session can do inside a workspace -- so both workspace scopes are
+    // resolved here and nowhere deeper. `read` is the price of admission; the rest travel with the
+    // capability request so the Overseer mints the narrower interface, rather than the full one
+    // policed after the fact. See `sessionScopes` on Overseer.open().
+    this.#requireScope("read", "open a workspace");
+    let sessionScopes = this.session.kind === "agent" ? this.session.scopes : undefined;
+
     let userId = this.#userId.toString();
     let profileId = this.#userId.name!;
     let overseerId;
@@ -252,7 +270,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
     let result;
     try {
-      result = await overseer.open(userId, profileId, notifyClosed, shareKey, configureObservers);
+      result = await overseer.open(
+          userId, profileId, notifyClosed, shareKey, configureObservers, sessionScopes);
     } catch (err) {
       // A denial proves this user's listing for the workspace is stale: revocation tries to drop it
       // (refreshAffectedCollaboratorListings), but that push is best-effort. Only catches entries
@@ -281,6 +300,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async newGadget(): Promise<RpcStub<Overseer>> {
+    this.#requireScope("build", "create a workspace");
     let id = this.overseers.newUniqueId().toString();
     await this.#user.newGadget(id, "Untitled Workspace");
     recordAnalytics(this.ctx, this.env, {
@@ -384,6 +404,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async removeBlueprintFromLibrary(blueprintId: string): Promise<void> {
+    this.#requireScope("build", "remove a blueprint from the library");
     return this.#user.removeBlueprintFromLibrary(blueprintId);
   }
 
@@ -392,6 +413,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
+    this.#requireScope("build", "import a blueprint");
     let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
     delete metadata.screenshot;
     let blueprintId = randomBlueprintId();
@@ -434,6 +456,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     blueprintId: string,
     bindings: Record<string, BlueprintBindingAssignment>
   ): Promise<RpcStub<Overseer>> {
+    this.#requireScope("build", "create a workspace from a blueprint");
+
     // 1. Read blueprint from KV.
     let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
@@ -550,6 +574,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async deleteOrphanedBlueprint(blueprintId: string): Promise<void> {
+    this.#requireScope("build", "delete a blueprint");
     return this.#user.deleteOwnedBlueprint(blueprintId);
   }
 
@@ -586,10 +611,17 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // --- Deployment admin ---
 
   async amIAdmin(): Promise<boolean> {
-    return this.#isAdmin();
+    // Answers "can this session act as an admin", which is what every caller uses it for -- so it
+    // must agree with getAdminApi() rather than report adminhood a scoped session can't exercise.
+    return hasScope(this.session, "admin") && this.#isAdmin();
   }
 
   async getAdminApi(): Promise<RpcStub<AdminApi> | null> {
+    // Two independent conditions, both necessary: the user must be an admin, and this session's
+    // credential must have been granted the admin scope. A scope never confers adminhood -- it only
+    // decides whether an admin's own agent connection inherits it. Returning null (rather than
+    // throwing) matches the non-admin case, so a scoped session looks exactly like a non-admin one.
+    if (!hasScope(this.session, "admin")) return null;
     if (!this.#isAdmin()) return null;
     // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
     // resource catalog so RBAC-gated ones still surface for this admin.
@@ -678,19 +710,25 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   }
 
   async authenticate(token: string): Promise<AuthenticatedApi> {
-    let split = token.split(':');
-    if (split.length !== 2) {
+    let { username, secret, prefixed } = parseCredential(token);
+
+    let userId = this.users.idFromName(username);
+    let session = await this.users.get(userId).authenticate(secret);
+
+    // The prefix is an advertisement of what the bearer holds; the storage record is the authority.
+    // Refuse a credential whose two disagree rather than silently trusting either: a browser token
+    // dressed up with the agent prefix, or an agent credential presented without it, is a caller
+    // confusing itself at best and probing at worst.
+    if (prefixed !== (session.kind === "agent")) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
 
-    let userId = this.users.idFromName(split[0]);
-    await this.users.get(userId).authenticate(split[1]);
     recordAnalytics(this.ctx, this.env, {
       event_name: "user_authenticated",
       user_id: userId.toString(),
-      source: "session_token",
+      source: session.kind === "agent" ? "agent_credential" : "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession, session);
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {

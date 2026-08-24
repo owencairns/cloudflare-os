@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, AgentScope, SessionAuthInfo, SessionKind, FULL_SCOPES, isAgentScope } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -78,9 +78,84 @@ export type UserChatContext = {
   quickModel?: AiModelConfig;
 }
 
+/**
+ * One login session. The token itself is never stored -- only its hash -- so a leaked storage dump
+ * cannot be replayed.
+ *
+ * Every field after `created` is optional because records written before agent credentials existed
+ * are still live in DO storage and must keep authenticating unchanged. A record with no `kind` is a
+ * browser session with full authority, which is what `describeSession()` reads it as; there is no
+ * migration pass and none is needed.
+ */
 type LoginSessionRecord = {
   tokenId: string,  // sha256 hash of token, hex-formatted
   created: Date,
+
+  /** Human-readable name for the connection, shown in audit surfaces. Agent credentials only. */
+  label?: string,
+
+  /** Absent on legacy records, which are browser sessions. */
+  kind?: SessionKind,
+
+  /** The scopes granted at mint time. Ignored for browser sessions, which always hold all of them. */
+  scopes?: AgentScope[],
+
+  /** Last time this credential authenticated, to the coarse resolution of `LAST_USED_RESOLUTION_MS`. */
+  lastUsed?: Date,
+
+  /** When this credential stops authenticating. Absent means it never expires. */
+  expiresAt?: Date,
+}
+
+/**
+ * How stale `lastUsed` is allowed to get before authenticate() writes it back. An agent may
+ * authenticate on every request, and the timestamp exists for "when was this connection last
+ * active", not for request accounting -- so a write per hour is plenty and keeps the hot
+ * authentication path free of a storage write.
+ */
+const LAST_USED_RESOLUTION_MS = 60 * 60 * 1000;
+
+/**
+ * One session as reported by `UserDurableObject.listSessions()` -- everything but the token itself.
+ * `tokenId` is the handle `revokeSession()` takes; it is the token's hash, so publishing it grants
+ * nothing.
+ */
+export type SessionSummary = SessionAuthInfo & {
+  tokenId: string;
+  created: Date;
+  lastUsed?: Date;
+  expiresAt?: Date;
+};
+
+/**
+ * Generate a session token, store only its hash, and return the secret. `grant` is omitted for
+ * browser sessions, which are recorded exactly as they were before agent credentials existed.
+ *
+ * A module-level function rather than a private method: it needs nothing from the DO but the
+ * sessions collection, and keeping it off the class keeps the single place tokens are created
+ * obvious.
+ */
+async function newSessionToken(
+    sessions: UserStorage["sessions"],
+    grant?: Omit<LoginSessionRecord, "tokenId" | "created" | "lastUsed">): Promise<string> {
+  let sessionToken = new Uint8Array(32);
+  crypto.getRandomValues(sessionToken);
+
+  let tokenId = new Uint8Array(await crypto.subtle.digest('SHA-256', sessionToken)).toHex();
+  sessions.put({ tokenId, created: new Date(), ...grant });
+
+  return sessionToken.toBase64();
+}
+
+/**
+ * Reads a stored session record as the authority it confers. This is the one place that decides
+ * what a legacy record (no `kind`) means: a browser session holding `FULL_SCOPES`.
+ */
+function describeSession(record: LoginSessionRecord): SessionAuthInfo {
+  if (record.kind !== "agent") {
+    return { kind: "browser", scopes: FULL_SCOPES };
+  }
+  return { kind: "agent", scopes: record.scopes ?? [], label: record.label };
 }
 
 // Blueprint record stored in the user's `blueprints` collection.
@@ -302,7 +377,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.vendors = buildGatekeeperVendorMap(env);
   }
 
-  async authenticate(token: string): Promise<void> {
+  /**
+   * Verify a session token and report what authority it carries.
+   *
+   * Returns the session's metadata rather than a bare success so the caller can enforce scopes at
+   * the capability seams; a browser session (and any record predating agent credentials) reports
+   * `FULL_SCOPES`, so callers never branch on the kind. An expired agent credential is deleted on
+   * sight and fails exactly like an unknown one -- a caller must not be able to distinguish
+   * "expired" from "never existed".
+   */
+  async authenticate(token: string): Promise<SessionAuthInfo> {
     let tokenBytes: Uint8Array;
     try {
       tokenBytes = Uint8Array.fromBase64(token);
@@ -317,6 +401,71 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!session) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
+
+    let now = Date.now();
+    if (session.expiresAt && session.expiresAt.valueOf() <= now) {
+      this.storage.sessions.delete(tokenId);
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
+
+    // Coarse write-back only; see LAST_USED_RESOLUTION_MS.
+    if (session.kind === "agent" &&
+        (!session.lastUsed || now - session.lastUsed.valueOf() >= LAST_USED_RESOLUTION_MS)) {
+      this.storage.sessions.put({ ...session, lastUsed: new Date(now) });
+    }
+
+    return describeSession(session);
+  }
+
+  /**
+   * Mint a scoped, revocable credential for an external agent, returning the bearer token exactly
+   * once. **Internal seam: this is the OAuth authorization endpoint's issuance point**, called once
+   * the user has approved a connection and the endpoint has decided which scopes that approval
+   * covers. It is reachable only from the Workshop worker (a Durable Object method), never from the
+   * `AuthenticatedApi` -- an agent must not be able to mint another agent.
+   *
+   * The returned string is the bare base64 secret; the caller composes the wire form
+   * (`AGENT_CREDENTIAL_PREFIX + username + ":" + secret`), since only it knows the username.
+   *
+   * Unknown scope names are rejected rather than dropped, so a typo in an authorization request
+   * fails loudly instead of silently issuing a weaker credential than was approved.
+   */
+  async mintAgentCredential(
+      label: string, scopes: string[], expiresAt?: Date): Promise<string> {
+    if (!label.trim()) {
+      throw new Error("An agent credential must carry a label identifying the connection.");
+    }
+    let unknown = scopes.filter(scope => !isAgentScope(scope));
+    if (unknown.length > 0) {
+      throw new Error(`Unknown scope(s): ${unknown.join(", ")}`);
+    }
+    // Dedupe so a repeated scope can't make the stored grant misrepresent what was approved.
+    let granted = [...new Set(scopes)] as AgentScope[];
+
+    return newSessionToken(
+        this.storage.sessions,
+        { kind: "agent", label: label.trim(), scopes: granted, expiresAt });
+  }
+
+  /**
+   * List this user's sessions, newest first, without exposing any token material. Serves the
+   * OAuth flow's "connected agents" view and revocation.
+   */
+  async listSessions(): Promise<SessionSummary[]> {
+    return Array.from(this.storage.sessions.list())
+        .map(record => ({
+          tokenId: record.tokenId,
+          created: record.created,
+          ...describeSession(record),
+          lastUsed: record.lastUsed,
+          expiresAt: record.expiresAt,
+        }))
+        .toSorted((a, b) => b.created.valueOf() - a.created.valueOf());
+  }
+
+  /** Revoke one session by its `tokenId`. Returns whether a session was actually removed. */
+  async revokeSession(tokenId: string): Promise<boolean> {
+    return this.storage.sessions.delete(tokenId);
   }
 
   /**
@@ -342,16 +491,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return false;
   }
 
-  async #newSessionToken(): Promise<string> {
-    let sessionToken = new Uint8Array(32);
-    crypto.getRandomValues(sessionToken);
-
-    let tokenId = new Uint8Array(await crypto.subtle.digest('SHA-256', sessionToken)).toHex();
-    this.storage.sessions.put({ tokenId, created: new Date() });
-
-    return sessionToken.toBase64();
-  }
-
   async login(passwordHash: Uint8Array): Promise<string | null> {
     let passwordHashHash = new Uint8Array(await crypto.subtle.digest('SHA-256', passwordHash));
 
@@ -364,7 +503,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       return null;
     }
 
-    return this.#newSessionToken();
+    return newSessionToken(this.storage.sessions);
   }
 
   async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
@@ -397,7 +536,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let passwordHashHash = new Uint8Array(await crypto.subtle.digest('SHA-256', passwordHash));
     this.storage.passwordHashHash.put(passwordHashHash);
 
-    return this.#newSessionToken();
+    return newSessionToken(this.storage.sessions);
   }
 
   /**
@@ -424,7 +563,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         id: email,
       });
     }
-    return this.#newSessionToken();
+    return newSessionToken(this.storage.sessions);
   }
 
   /** Whether this account has a password set (false for gatekeeper sign-in accounts). */
