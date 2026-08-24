@@ -6,7 +6,6 @@ import {
   Pencil,
   Check,
   X,
-  Hexagon,
   Blueprint,
   Trash,
   ArrowsOutSimple,
@@ -18,6 +17,7 @@ import { RpcStub, RpcTarget } from 'capnweb'
 import { useAuthenticatedApi } from './AuthContext'
 import { useConnectionLost } from './RpcContext'
 import UserMenu from './components/UserMenu'
+import MyoPlanMark from './components/MyoPlanMark'
 import SiteLogo from './components/SiteLogo'
 
 import {
@@ -1395,7 +1395,7 @@ export default function GadgetEditor() {
             className="flex-shrink-0 hover:opacity-80 transition-opacity"
           >
             <SiteLogo size={22}>
-              <Hexagon size={22} className="text-kumo-brand" weight="bold" />
+              <MyoPlanMark size={22} />
             </SiteLogo>
           </Link>
 
