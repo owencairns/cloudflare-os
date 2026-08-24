@@ -798,9 +798,13 @@ export const MCP_TOOLS: readonly McpTool[] = [
     handler: async (args, ctx) => {
       let bindings =
           (args.bindings as Record<string, BlueprintBindingAssignment> | undefined) ?? {};
-      let overseer = await ctx.api.newGadgetFromBlueprint(
-          args.blueprintId as string, bindings) as unknown as Overseer;
+      // The call itself is inside the try: its expected failures -- an unknown blueprint id, a
+      // required binding left unassigned -- are the whole reason this tool reports a ToolError, and
+      // leaving it outside would let exactly those escape as protocol errors instead.
+      let overseer: Overseer | undefined;
       try {
+        overseer = await ctx.api.newGadgetFromBlueprint(
+            args.blueprintId as string, bindings) as unknown as Overseer;
         let metadata = await overseer.getMetadata();
         return jsonResult({ workspace: workspaceSummary(metadata) });
       } catch (error) {
