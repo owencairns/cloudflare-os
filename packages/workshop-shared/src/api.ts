@@ -1192,7 +1192,7 @@ export const WORKERS_AI_OUTPUT_LIMIT = 32768;
  */
 export const SUGGESTED_MODELS: Record<
   AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
+  Record<string, {name: string, contextWindow: number, outputLimit?: number, apiUrl?: string}>
 > = {
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
@@ -1221,6 +1221,12 @@ export const SUGGESTED_MODELS: Record<
   "ollama": {
   },
   "openai-compatible": {
+    // OpenRouter stealth model; also in the OpenAI-compatible catalog via EXTRA_MODELS in
+    // build-openai-compatible-models.mjs. apiUrl prefills the base URL in AddModelModal.
+    "stealth/ox-alpha": {
+      name: "Ox Alpha (OpenRouter)", contextWindow: 1048576, outputLimit: 131072,
+      apiUrl: "https://openrouter.ai/api/v1",
+    },
   },
 };
 

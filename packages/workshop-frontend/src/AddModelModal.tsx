@@ -165,7 +165,10 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     }
     setApiToken('')
     setAccountId('')
-    setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
+    const suggestedApiUrl = sel.type === 'suggested'
+      ? SUGGESTED_MODELS[sel.provider][sel.modelId]?.apiUrl
+      : undefined
+    setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : suggestedApiUrl ?? '')
     setContextWindow('')
     setOutputLimit('')
   }

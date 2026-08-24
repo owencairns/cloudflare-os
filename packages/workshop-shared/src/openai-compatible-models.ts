@@ -486,6 +486,7 @@ const MODELS = {
     "relace/relace-search": ["Relace: Relace Search",256000,128000],
     "sakana/fugu-ultra": ["Sakana: Fugu Ultra",1000000,128000],
     "sao10k/l3.1-euryale-70b": ["Sao10K: Llama 3.1 Euryale 70B v2.2",131072,16384],
+    "stealth/ox-alpha": ["Ox Alpha",1048576,131072],
     "stepfun/step-3.5-flash": ["StepFun: Step 3.5 Flash",262144,65536],
     "stepfun/step-3.7-flash": ["StepFun: Step 3.7 Flash",256000,256000],
     "tencent/hy3": ["Tencent: Hy3",262144,128000],

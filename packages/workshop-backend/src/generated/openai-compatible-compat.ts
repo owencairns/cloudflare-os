@@ -484,6 +484,7 @@ const COMPATIBILITY = {
     "relace/relace-search": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
     "sakana/fugu-ultra": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
     "sao10k/l3.1-euryale-70b": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
+    "stealth/ox-alpha": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
     "stepfun/step-3.5-flash": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
     "stepfun/step-3.7-flash": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
     "tencent/hy3": {"supportsDeveloperRole":false,"thinkingFormat":"openrouter"},
