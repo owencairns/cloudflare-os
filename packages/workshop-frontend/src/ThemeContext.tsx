@@ -60,3 +60,12 @@ export function useTheme() {
   if (!context) throw new Error('useTheme must be used within ThemeProvider')
   return context
 }
+
+/**
+ * Like `useTheme`, but returns null instead of throwing when no provider is mounted. For components
+ * that only *observe* the mode and have a sensible fallback (e.g. reading what is already applied to
+ * <html>), so they stay renderable in isolation -- tests, embeds -- without a provider.
+ */
+export function useOptionalTheme(): ThemeContextValue | null {
+  return useContext(ThemeContext)
+}

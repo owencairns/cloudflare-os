@@ -2,7 +2,10 @@ import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
-import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
+import { GadgetClient, ConsoleLogEvent, isHexColor } from '@gadgets/workshop-shared/api'
+import { useOptionalTheme } from './ThemeContext'
+import { useServerConfig } from './ServerConfigContext'
+import type { ResolvedThemeMode } from './theme'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -83,6 +86,24 @@ window.addEventListener('click', (event) => {
   anchor.setAttribute('rel', Array.from(rel).join(' '));
 }, true);
 
+// Mirror the Workshop's light/dark mode onto this document. The host seeds data-mode into the
+// iframe markup so the *first paint* is already correct, then posts {type: "myoplan-theme", mode}
+// on load and on every host theme change. Applying it here means a gadget gets host-driven theming
+// for free from :root[data-mode="dark"] CSS; gadgets that want to react in JS can still listen
+// for the same message themselves.
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data || data.type !== 'myoplan-theme') return;
+  if (data.mode !== 'light' && data.mode !== 'dark') return;
+  document.documentElement.dataset.mode = data.mode;
+  document.documentElement.style.colorScheme = data.mode;
+  if (typeof data.accentColor === 'string' && data.accentColor) {
+    document.documentElement.dataset.accentColor = data.accentColor;
+  } else {
+    delete document.documentElement.dataset.accentColor;
+  }
+});
+
 // Capture unhandled exceptions and promise rejections.
 window.addEventListener('error', (event) => {
   window.parent.postMessage({
@@ -102,9 +123,24 @@ window.addEventListener('unhandledrejection', (event) => {
 
 `);
 
-const createSandboxedHtml = (jsCode: string): string => {
+/** The appearance state the host pushes into gadget iframes. `mode` is the resolved mode. */
+export interface GadgetTheme {
+  mode: ResolvedThemeMode
+  accentColor: string | null
+}
+
+/** The message the host posts into a gadget iframe whenever the resolved theme changes. */
+export const GADGET_THEME_MESSAGE_TYPE = 'myoplan-theme'
+
+const createSandboxedHtml = (jsCode: string, theme: GadgetTheme): string => {
+  // Seeding data-mode into the markup means first paint is already correct -- no flash of the wrong
+  // theme while we wait for the postMessage to arrive. Attributes are inert content, so this needs
+  // nothing from the CSP (which forbids everything but data: URLs and inline script/style).
+  const accentAttribute = theme.accentColor && isHexColor(theme.accentColor)
+    ? ` data-accent-color="${theme.accentColor}"`
+    : ''
   return `<!DOCTYPE html>
-<html>
+<html data-mode="${theme.mode}"${accentAttribute} style="color-scheme: ${theme.mode}">
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src 'none'; script-src data: 'unsafe-inline'; style-src data: 'unsafe-inline'; img-src data:; media-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none';">
@@ -161,6 +197,34 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     reject: (reason: unknown) => void
   } | null>(null)
   const rpcSessionRef = useRef<any>(null)
+  // Push the Workshop's resolved light/dark mode (and deployment accent) into the gadget iframe, the
+  // same appearance state SandboxedGatekeeperApp hands to gatekeeper apps over RPC. Gadgets have no
+  // RPC channel back to the host frame, so the transport here is a plain postMessage.
+  const themeContext = useOptionalTheme()
+  // Without a ThemeProvider, fall back to whatever mode is already applied to <html> -- the provider
+  // is the only thing that sets it, so reading it back is the same answer without the dependency.
+  const resolvedThemeMode: ResolvedThemeMode = themeContext?.resolvedThemeMode
+    ?? (document.documentElement.getAttribute('data-mode') === 'dark' ? 'dark' : 'light')
+  const configuredAccentColor = useServerConfig()?.accentColor
+  const accentColor = configuredAccentColor && isHexColor(configuredAccentColor)
+    ? configuredAccentColor
+    : null
+  const themeRef = useRef<GadgetTheme>({ mode: resolvedThemeMode, accentColor })
+  themeRef.current = { mode: resolvedThemeMode, accentColor }
+
+  const postTheme = () => {
+    iframeRef.current?.contentWindow?.postMessage(
+      { type: GADGET_THEME_MESSAGE_TYPE, ...themeRef.current },
+      '*',
+    )
+  }
+
+  // Re-push on every host theme change. The iframe is *not* rebuilt: the markup seed only has to be
+  // right for first paint, and rebuilding srcDoc would remount (and reset) the running gadget.
+  useEffect(() => {
+    postTheme()
+  }, [resolvedThemeMode, accentColor])
+
   // Keep latest callbacks in refs so the message-handler effect never tears down the RPC session.
   const onIframeEscapeRef = useRef(onIframeEscape)
   const onConsoleLogRef = useRef(onConsoleLog)
@@ -294,7 +358,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         const bundle = await gadget.getUiBundle(chatId)
         if (!isCurrent()) return
         if (bundle) {
-          const html = createSandboxedHtml(bundle.jsCode)
+          const html = createSandboxedHtml(bundle.jsCode, themeRef.current)
           setSandboxedHtml(html)
         } else {
           setSandboxedHtml(null)
@@ -339,6 +403,9 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
 
       if (event.data === 'handshake' && event.ports && event.ports[0]) {
         const port = event.ports[0]
+        // The handshake is the earliest proof the gadget's script is running and listening, so it is
+        // the earliest safe moment to push the theme. (`load` also pushes, as a backstop.)
+        postTheme()
         let gadgetStub: any = null
         resetConnection(new Error('Gadget iframe reloaded.'))
         const generation = connectionGenerationRef.current
@@ -494,6 +561,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         key={`${reloadTrigger}:${iframeGeneration}`}
         ref={iframeRef}
         srcDoc={sandboxedHtml}
+        onLoad={postTheme}
         style={{
           display: 'block',
           width: '100%',

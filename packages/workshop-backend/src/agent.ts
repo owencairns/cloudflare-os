@@ -614,6 +614,36 @@ DO NOT import \`RpcTarget\` in client.js. It is already imported.
 
 If you need \`RpcTarget\` in server.js, you can import it from "cloudflare:workers".
 
+## Light and Dark Mode
+
+The Workshop has its own light/dark toggle, which is NOT the same as the operating system's setting. It pushes its resolved mode into the Gadget iframe two ways:
+
+1. The iframe document is created with \`data-mode="light"\` or \`data-mode="dark"\` already set on \`<html>\`, so the very first paint is correct.
+2. Whenever the Workshop's theme changes, the host posts a message into the iframe: \`{ type: "myoplan-theme", mode: "light" | "dark", accentColor: string | null }\`. \`mode\` is always the resolved mode -- never \`"system"\`. \`accentColor\` is the deployment's accent seed as a hex string, or null.
+
+The iframe runtime already applies incoming messages for you: it sets \`document.documentElement.dataset.mode\` (plus \`style.colorScheme\`, and \`dataset.accentColor\` when an accent is set). So you do NOT need a message listener just to follow the theme.
+
+Style against that attribute, with \`prefers-color-scheme\` only as a fallback for contexts where no host is driving (e.g. a standalone HTML export):
+
+\`\`\`
+:root { --bg: #ffffff; --fg: #101010; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-mode="light"]) { --bg: #111111; --fg: #f0f0f0; }
+}
+:root[data-mode="dark"] { --bg: #111111; --fg: #f0f0f0; }
+body { background: var(--bg); color: var(--fg); }
+\`\`\`
+
+Note the ordering: define the light palette on bare \`:root\`, let the media query cover the no-host case (guarded with \`:not([data-mode="light"])\` so an explicit light choice still wins), and let \`[data-mode="dark"]\` win outright. Never define a color ONLY inside a media query, and always paint an explicit background on \`body\`.
+
+If a Gadget needs to react to a mode change in JavaScript -- redrawing a canvas or chart, for example -- listen for the same message yourself:
+
+\`\`\`
+window.addEventListener("message", (event) => {
+  if (event.data?.type === "myoplan-theme") redraw(event.data.mode);
+});
+\`\`\`
+
 ## Design Tips
 
 * ALWAYS store server state in Durable Object storage, not just in memory. Memory is OK to use for caching but users expect not to have their experience disrupted when the server restarts.
