@@ -23,6 +23,7 @@ import { Route as WorkspacesRouteImport } from './routes/workspaces'
 import { Route as BlueprintIdRouteImport } from './routes/blueprint.$id'
 import { Route as GadgetIdRouteImport } from './routes/gadget.$id'
 import { Route as GatekeepersAppIdRouteImport } from './routes/gatekeepers_.$appId'
+import { Route as OauthApproveRouteImport } from './routes/oauth.approve'
 import { Route as WorkspaceIdRouteImport } from './routes/workspace.$id'
 
 const IndexRoute = IndexRouteImport.update({
@@ -95,6 +96,11 @@ const GatekeepersAppIdRoute = GatekeepersAppIdRouteImport.update({
   path: '/gatekeepers/$appId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const OauthApproveRoute = OauthApproveRouteImport.update({
+  id: '/oauth/approve',
+  path: '/oauth/approve',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const WorkspaceIdRoute = WorkspaceIdRouteImport.update({
   id: '/workspace/$id',
   path: '/workspace/$id',
@@ -116,6 +122,7 @@ export interface FileRoutesByFullPath {
   '/blueprint/$id': typeof BlueprintIdRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
+  '/oauth/approve': typeof OauthApproveRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRoutesByTo {
@@ -133,6 +140,7 @@ export interface FileRoutesByTo {
   '/blueprint/$id': typeof BlueprintIdRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
+  '/oauth/approve': typeof OauthApproveRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRoutesById {
@@ -151,6 +159,7 @@ export interface FileRoutesById {
   '/blueprint/$id': typeof BlueprintIdRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers_/$appId': typeof GatekeepersAppIdRoute
+  '/oauth/approve': typeof OauthApproveRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRouteTypes {
@@ -170,6 +179,7 @@ export interface FileRouteTypes {
     | '/blueprint/$id'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
+    | '/oauth/approve'
     | '/workspace/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -187,6 +197,7 @@ export interface FileRouteTypes {
     | '/blueprint/$id'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
+    | '/oauth/approve'
     | '/workspace/$id'
   id:
     | '__root__'
@@ -204,6 +215,7 @@ export interface FileRouteTypes {
     | '/blueprint/$id'
     | '/gadget/$id'
     | '/gatekeepers_/$appId'
+    | '/oauth/approve'
     | '/workspace/$id'
   fileRoutesById: FileRoutesById
 }
@@ -222,6 +234,7 @@ export interface RootRouteChildren {
   BlueprintIdRoute: typeof BlueprintIdRoute
   GadgetIdRoute: typeof GadgetIdRoute
   GatekeepersAppIdRoute: typeof GatekeepersAppIdRoute
+  OauthApproveRoute: typeof OauthApproveRoute
   WorkspaceIdRoute: typeof WorkspaceIdRoute
 }
 
@@ -325,6 +338,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof GatekeepersAppIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/oauth/approve': {
+      id: '/oauth/approve'
+      path: '/oauth/approve'
+      fullPath: '/oauth/approve'
+      preLoaderRoute: typeof OauthApproveRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/workspace/$id': {
       id: '/workspace/$id'
       path: '/workspace/$id'
@@ -350,6 +370,7 @@ const rootRouteChildren: RootRouteChildren = {
   BlueprintIdRoute: BlueprintIdRoute,
   GadgetIdRoute: GadgetIdRoute,
   GatekeepersAppIdRoute: GatekeepersAppIdRoute,
+  OauthApproveRoute: OauthApproveRoute,
   WorkspaceIdRoute: WorkspaceIdRoute,
 }
 export const routeTree = rootRouteImport

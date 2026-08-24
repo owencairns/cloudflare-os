@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, AgentScope, SessionAuthInfo, FULL_SCOPES, hasScope, createScopeError } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, AgentScope, SessionAuthInfo, FULL_SCOPES, hasScope, createScopeError, AgentConnectionInfo, AgentAuthorizationRequest, AgentAuthorizationDecision, isAgentScope } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -10,10 +10,17 @@ import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { getUsageInfo } from "./ai-gateway-billing/limits/usage-checker.js";
 import { listConnectedAccounts, selectAccount } from "./ai-gateway-billing/cloudflare/connection-service.js";
 import { PendingLogin, LoginConnectCallbackImpl } from "./auth/login-flow.js";
+import { OAuthProvider } from "./auth/oauth/provider.js";
+import {
+  buildAuthorizationRedirect, buildDenialRedirect, handleOAuthRequest, isOAuthPath,
+} from "./auth/oauth/endpoints.js";
 import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from "./admin-config.js";
 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
+
+// Re-export the authorization server's storage DO (see src/auth/oauth/provider.ts).
+export { OAuthProvider };
 import { GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
 import { getAiGatewayConfig } from "./ai-gateway.js";
@@ -130,6 +137,117 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   whoami(): Promise<AiChatAuthorInfo> {
     // Pure-read delegations retry once across a user-DO reset (see retryOnDoReset); writes never do.
     return retryOnDoReset(() => this.#user.whoami());
+  }
+
+  // --- Agent connections (the OAuth flow's user-facing half) ---
+
+  /**
+   * Refuses unless this session is a browser session.
+   *
+   * Not a scope check, deliberately: there is no scope that ought to let one agent credential
+   * approve, enumerate or revoke another. Minting authority is the user's alone, and the only
+   * credential that carries the user's *presence* (rather than a delegation of it) is the one their
+   * browser holds. An agent granted every scope still fails here.
+   */
+  #requireBrowserSession(what: string): void {
+    if (this.session.kind !== "browser") {
+      throw new Error(
+          `Only a signed-in browser session may ${what}; an agent connection cannot.`);
+    }
+  }
+
+  async listAgentConnections(): Promise<AgentConnectionInfo[]> {
+    this.#requireBrowserSession("list agent connections");
+    let sessions = await retryOnDoReset(() => this.#user.listSessions());
+    return sessions
+        .filter((entry: (typeof sessions)[number]) => entry.kind === "agent")
+        .map((entry: (typeof sessions)[number]) => ({
+          tokenId: entry.tokenId,
+          // A record always carries a label -- mintAgentCredential() refuses an empty one -- but the
+          // type allows its absence for browser sessions, which the filter above already excluded.
+          label: entry.label ?? "Unnamed connection",
+          scopes: entry.scopes,
+          created: entry.created,
+          lastUsed: entry.lastUsed,
+          expiresAt: entry.expiresAt,
+        }));
+  }
+
+  async revokeAgentConnection(tokenId: string): Promise<boolean> {
+    this.#requireBrowserSession("revoke an agent connection");
+    // Check the kind first: `revokeSession` would happily delete a browser session, and this method
+    // is reachable with any tokenId the caller can name. Revoking browser sessions may be worth
+    // offering one day, but it must be its own, clearly-labelled action -- not a side effect here.
+    let sessions = await this.#user.listSessions();
+    let target = sessions.find((entry: (typeof sessions)[number]) => entry.tokenId === tokenId);
+    if (!target || target.kind !== "agent") return false;
+    return this.#user.revokeSession(tokenId);
+  }
+
+  // --- The OAuth approval screen ---
+
+  async getAgentAuthorizationRequest(requestId: string): Promise<AgentAuthorizationRequest | null> {
+    this.#requireBrowserSession("approve an agent connection");
+    let record = await this.ctx.exports.OAuthProvider.getByName("")
+        .getAuthorizationRequest(requestId);
+    if (!record) return null;
+    return {
+      requestId: record.requestId,
+      clientName: record.clientName,
+      redirectUri: record.redirectUri,
+      requestedScopes: record.requestedScopes,
+      grantableScopes: this.#grantableScopes(record.requestedScopes),
+    };
+  }
+
+  async decideAgentAuthorization(
+      requestId: string, decision: AgentAuthorizationDecision): Promise<string> {
+    this.#requireBrowserSession("approve an agent connection");
+    let provider = this.ctx.exports.OAuthProvider.getByName("");
+    // Consumed on read, so a decision -- either way -- happens exactly once. A double-submitted
+    // approval fails loudly here rather than minting a second credential.
+    let record = await provider.consumeAuthorizationRequest(requestId);
+    if (!record) {
+      throw new Error("This authorization request has expired or was already answered.");
+    }
+
+    if (!decision.approve) {
+      return buildDenialRedirect(record.redirectUri, record.state);
+    }
+
+    // The user may narrow what was requested but never widen it, and never past what they are
+    // allowed to grant at all -- so the approved set is an intersection, computed here rather than
+    // trusted from the page.
+    let grantable = this.#grantableScopes(record.requestedScopes);
+    let approved = grantable.filter(scope => decision.scopes.includes(scope));
+    if (decision.scopes.some(scope => !isAgentScope(scope) || !grantable.includes(scope))) {
+      throw new Error("Approved scopes must be a subset of the scopes this request may grant.");
+    }
+    if (approved.length === 0) {
+      throw new Error("Approving a connection requires granting at least one scope.");
+    }
+
+    let code = await provider.issueCode({
+      clientId: record.clientId,
+      clientName: record.clientName,
+      redirectUri: record.redirectUri,
+      codeChallenge: record.codeChallenge,
+      scopes: approved,
+      username: this.#userId.name!,
+      resource: record.resource,
+    });
+    return buildAuthorizationRedirect(record.redirectUri, code, record.state);
+  }
+
+  /**
+   * The requested scopes this user is actually able to grant. `admin` is dropped for a non-admin,
+   * so the approval screen never offers -- and an approval never records -- authority the account
+   * does not have. (Granting it anyway would be harmless, since `getAdminApi()` checks adminhood
+   * independently, but showing a user a permission they cannot give is a lie.)
+   */
+  #grantableScopes(requested: readonly AgentScope[]): AgentScope[] {
+    let isAdmin = this.#isAdmin();
+    return requested.filter(scope => scope !== "admin" || isAdmin);
   }
   setOwnDisplayName(name: string): Promise<void> {
     return this.#user.setOwnDisplayName(name);
@@ -874,6 +992,17 @@ export default {
     // OAuth redirect lands on `/gatekeeper/<name>/oauth`); the result is bridged back to the waiting
     // browser via the `attempt` stub from PublicApi.startGatekeeperLogin(). So the backend no longer
     // hosts /auth/* callbacks.
+
+    // The OAuth authorization server: discovery metadata, dynamic client registration, and the
+    // authorize/token endpoints. It sits beside /mcp because it exists for /mcp -- the 401 there
+    // names the metadata document served here, and the credential minted here is what /mcp accepts.
+    // See src/auth/oauth/endpoints.ts for the full chain.
+    if (isOAuthPath(url.pathname)) {
+      return handleOAuthRequest(req, url, {
+        provider: ctx.exports.OAuthProvider,
+        users: ctx.exports.UserDurableObject,
+      });
+    }
 
     if (url.pathname === "/api/client-errors") {
       return handleClientErrorRequest(req, env, ctx);

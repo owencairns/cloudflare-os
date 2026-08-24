@@ -56,10 +56,17 @@
       // login back to the waiting browser.
       "tag": "v2",
       "new_sqlite_classes": [ "PendingLogin" ]
+    },
+    {
+      // The OAuth authorization server's state: registered MCP clients, pending authorization
+      // requests, and one-time authorization codes. Access tokens are NOT here -- they are agent
+      // sessions in each user's own DO. See src/auth/oauth/provider.ts.
+      "tag": "v3",
+      "new_sqlite_classes": [ "OAuthProvider" ]
     }
   ],
 
-  // All DO classes (UserDurableObject, OverseerDurableObject, AdminSettings, PendingLogin, ...) are
+  // All DO classes (UserDurableObject, OverseerDurableObject, AdminSettings, PendingLogin, OAuthProvider, ...) are
   // reached via ctx.exports and need no explicit durable_objects binding.
   "kv_namespaces": [
     {
@@ -89,7 +96,13 @@
   // "assets": {
   //   "directory": "../workshop-frontend/dist",
   //   "not_found_handling": "single-page-application",
-  //   "run_worker_first": ["/api", "/api/*", "/mcp", "/mcp/*", "/blueprint-screenshot/*"]
+  //   "run_worker_first": [
+  //     "/api", "/api/*", "/mcp", "/mcp/*",
+  //     "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/*",
+  //     "/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/*",
+  //     "/oauth/register", "/oauth/authorize", "/oauth/token",
+  //     "/blueprint-screenshot/*"
+  //   ]
   // },
   "observability": {
     "enabled": true,

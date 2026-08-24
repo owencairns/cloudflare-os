@@ -30,6 +30,10 @@ export default defineConfig({
     // test in the file finishes in tens of milliseconds. The timeout has to clear that cold
     // start, not the steady-state cost, or the first test fails wherever the runner is slow.
     testTimeout: 60_000,
+    // A suite whose `beforeAll` creates the test account pays that same cold start inside a hook,
+    // where vitest's default allowance is 10s -- close enough to the observed boot time that it
+    // fails on a cold machine and intermittently on a warm one. Same reasoning, same number.
+    hookTimeout: 60_000,
     // A rejected future capability is reported independently from the awaited pipelined call.
     // The tests assert these exact rejections; all unrelated unhandled errors remain fatal.
     onUnhandledError(error) {
@@ -39,6 +43,18 @@ export default defineConfig({
       // held across the abort (e.g. the fire-and-forget AdminSettings install kicked off by the
       // fetch handler) reject on their own schedule, independent of any awaited call.
       if (error.message?.includes("abortAllDurableObjects")) return false;
+      // The OAuth suite asserts a set of deliberate refusals (a replayed authorization request, an
+      // over-wide scope approval, an agent credential reaching a browser-only method). Cap'n Web
+      // surfaces each rejection a second time, independently of the assertion that already caught
+      // it; these are the exact messages, so an unexpected refusal is still fatal.
+      for (const expected of [
+        "This authorization request has expired or was already answered.",
+        "Approved scopes must be a subset of the scopes this request may grant.",
+        "Approving a connection requires granting at least one scope.",
+        "an agent connection cannot.",
+      ]) {
+        if (error.message?.includes(expected)) return false;
+      }
       // Same, for the test that aborts only the user DO (state.abort with this reason).
       if (error.message?.includes("user-DO reset injected by test")) return false;
     },

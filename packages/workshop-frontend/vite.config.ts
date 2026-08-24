@@ -75,6 +75,16 @@ export default defineConfig(({ mode }) => {
         '/api/client-errors': `http://${backendHost}`,
         '/blueprint-screenshot': `http://${backendHost}`,
         '/api/site-logo': `http://${backendHost}`,
+        // The MCP endpoint and its authorization server, so an MCP client can be pointed at the
+        // Vite origin in ordinary dev and complete the whole flow -- including the hop through the
+        // approval page, which is a route of *this* server. `/oauth/approve` is deliberately not
+        // proxied: it is the page. (Proxy keys match by prefix, hence the per-endpoint entries.)
+        '/mcp': `http://${backendHost}`,
+        '/.well-known/oauth-protected-resource': `http://${backendHost}`,
+        '/.well-known/oauth-authorization-server': `http://${backendHost}`,
+        '/oauth/register': `http://${backendHost}`,
+        '/oauth/authorize': `http://${backendHost}`,
+        '/oauth/token': `http://${backendHost}`,
       },
     },
     build: {

@@ -21,6 +21,27 @@ export interface Env {
   [key: string]: unknown;
 }
 
+/**
+ * The OAuth authorization server's paths, which belong to the backend rather than the single-page
+ * app. Mirrors `isOAuthPath()` in workshop-backend (src/auth/oauth/endpoints.ts) -- duplicated
+ * rather than imported because this worker deliberately depends on nothing, and it must agree with
+ * `run_worker_first` in wrangler.jsonc anyway, which is a list of strings either way.
+ *
+ * `/oauth/approve` is pointedly **not** here: the approval screen is a frontend route, so it must
+ * fall through to the SPA.
+ *
+ * The well-known paths match by prefix so the spec's path-inserted variants
+ * (`/.well-known/oauth-protected-resource/mcp`) reach the backend too.
+ */
+function isOAuthBackendPath(pathname: string): boolean {
+  for (const wellKnown of ["/.well-known/oauth-protected-resource",
+                           "/.well-known/oauth-authorization-server"]) {
+    if (pathname === wellKnown || pathname.startsWith(wellKnown + "/")) return true;
+  }
+  return pathname === "/oauth/register" || pathname === "/oauth/authorize" ||
+      pathname === "/oauth/token";
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
@@ -40,6 +61,7 @@ export default {
     // the single-page app's HTML, which it would try to parse as JSON.
     if (url.pathname === "/api" || url.pathname.startsWith("/api/") ||
         url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") ||
+        isOAuthBackendPath(url.pathname) ||
         url.pathname === "/blueprint-screenshot" ||
         url.pathname.startsWith("/blueprint-screenshot/")) {
       return env.WORKSHOP_BACKEND.fetch(req);

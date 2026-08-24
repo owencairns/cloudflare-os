@@ -1,22 +1,26 @@
 // Authenticating a request to `/mcp`, and the challenge that starts OAuth discovery when it isn't
 // authenticated.
 //
-// **Where this is going.** External agents will authenticate to `/mcp` via the MCP authorization
-// spec: the 401 below carries a `WWW-Authenticate` header naming this deployment's
-// protected-resource metadata, the client fetches that, discovers the authorization server, and
-// completes an authorization-code + PKCE flow (registering itself dynamically if it has no client
-// id). Bearer tokens issued that way carry the scopes the user approved.
+// **How an external agent gets in.** Via the MCP authorization spec, and only that way: the 401
+// below carries a `WWW-Authenticate` header naming this deployment's protected-resource metadata,
+// the client fetches it, discovers the authorization server (this same origin), registers itself
+// dynamically, and completes an authorization-code + PKCE flow against a user-facing approval
+// screen. See src/auth/oauth/endpoints.ts for the whole chain. There is deliberately no
+// user-facing token minting anywhere in the product.
 //
-// **Where it is today.** None of that exists yet -- it is the next branch. What exists is the
-// *shape* it will slot into:
+// **Why that adds no validator here.** The credential that flow issues *is* an agent credential --
+// the token endpoint mints it through `UserDurableObject.mintAgentCredential()`, the same call and
+// the same storage as any other agent session. So the validator below, which already owned agent
+// credentials, owns OAuth-issued ones with no change: the record it resolves carries the scopes the
+// user approved on that screen, and those become the principal's scopes verbatim. `McpCredentialKind`
+// keeps a distinct `"oauth"` member for the day some other issuer appears, but nothing produces it
+// today, and a credential that reported it would be claiming a distinction storage cannot make.
 //
-//   - Credential validation is a list (`CREDENTIAL_VALIDATORS`). Today it holds one entry, the
-//     session token the web UI already issues, which is what makes this endpoint testable now. An
-//     OAuth validator is one more entry; nothing else moves.
-//   - Every unauthenticated request already answers with the spec's challenge, pointing at
-//     `/.well-known/oauth-protected-resource`. That path 404s until the next branch serves it, but
-//     the header a client keys off is correct from day one, so adding the metadata endpoints is
-//     purely additive.
+// The surrounding shape:
+//
+//   - Credential validation is a list (`CREDENTIAL_VALIDATORS`), ordered, first match wins.
+//   - Every unauthenticated request answers with the spec's challenge, pointing at
+//     `/.well-known/oauth-protected-resource`, which the backend now serves.
 //   - Whatever a validator returns is an `McpPrincipal` carrying `scopes`. A browser session
 //     token's scopes are `null`, meaning "unscoped, everything the user can do" -- distinct from
 //     `[]`, which a credential with no approved scopes would carry. Tool dispatch consults this
@@ -34,8 +38,10 @@ import type { AgentScope, AuthenticatedApi, SessionAuthInfo } from "@gadgets/wor
 import { AGENT_CREDENTIAL_PREFIX } from "@gadgets/workshop-shared/api";
 import { mcpResponse } from "@gadgets/mcp-server/transport";
 
-/** Where the protected-resource metadata will live (RFC 9728). Served by the OAuth branch. */
-export const PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";
+// The challenge below must name the document the authorization server actually serves, so the path
+// is imported from the module that serves it rather than restated here.
+export { PROTECTED_RESOURCE_METADATA_PATH } from "../auth/oauth/protocol.js";
+import { PROTECTED_RESOURCE_METADATA_PATH } from "../auth/oauth/protocol.js";
 
 /** The `realm` a challenge advertises. Cosmetic, but clients display it during consent. */
 const AUTH_REALM = "MyoPlan OS";
@@ -118,9 +124,8 @@ const CREDENTIAL_VALIDATORS: readonly CredentialValidator[] = [
       };
     },
   },
-  // ==> The OAuth validator lands here. It will match an opaque bearer token, verify it against the
-  //     authorization server's introspection (or its own signature), and return
-  //     `{kind: "oauth", scopes: <approved scopes>, api}` -- the same `AgentScope` vocabulary.
+  // No separate OAuth validator: the flow issues `mpk_` agent credentials, which the entry above
+  // already owns. See the note at the top of this file.
 ];
 
 /** Parses `Authorization: Bearer <credential>`, case-insensitively on the scheme. */

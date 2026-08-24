@@ -8,6 +8,7 @@ import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash } from '@phos
 import { useAvatar, invalidateAvatarCache } from './useAvatar'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
 import UsageSettings from './components/billing/UsageSettings'
+import AgentConnections from './components/AgentConnections'
 import { useDocumentTitle } from './useDocumentTitle'
 import { isImeComposing } from './keyboardEvent'
 
@@ -381,6 +382,9 @@ export default function SettingsPage() {
 
         {/* Usage & billing — only when the Cloudflare limits flow is enabled server-side */}
         <UsageSettings />
+
+        {/* Agent connections granted through the OAuth flow. Renders nothing until there is one. */}
+        <AgentConnections />
 
         {/* Security — only for password accounts (hidden under CF Access or gatekeeper sign-in) */}
         {!CF_ACCESS_MODE && hasPassword === true && (
