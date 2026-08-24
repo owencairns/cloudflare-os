@@ -1,0 +1,27 @@
+{
+  "name": "@gadgets/mcp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./jsonrpc": "./src/jsonrpc.ts",
+    "./server": "./src/server.ts",
+    "./tool": "./src/tool.ts",
+    "./transport": "./src/transport.ts"
+  },
+  "scripts": {
+    "build": "tsc && tsc -p tsconfig.test.json",
+    "clean": "rm -rf dist",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/core": "2.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "catalog:",
+    "typescript6": "npm:typescript@6.0.3",
+    "vitest": "catalog:"
+  }
+}

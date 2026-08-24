@@ -34,7 +34,12 @@ export default {
       }
     }
 
+    // `/mcp` is the Model Context Protocol endpoint for external MCP clients. The `/mcp/*` prefix
+    // is forwarded too even though the backend answers only `/mcp` today: MCP's authorization flow
+    // will add sibling paths, and a client probing one should reach the backend's 404 rather than
+    // the single-page app's HTML, which it would try to parse as JSON.
     if (url.pathname === "/api" || url.pathname.startsWith("/api/") ||
+        url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") ||
         url.pathname === "/blueprint-screenshot" ||
         url.pathname.startsWith("/blueprint-screenshot/")) {
       return env.WORKSHOP_BACKEND.fetch(req);

@@ -1,0 +1,9 @@
+// Type-checks the tests too. Separate from `tsconfig.json` so the library's own check stays free of
+// test files and Node types.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src", "__tests__"]
+}

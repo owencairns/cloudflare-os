@@ -522,7 +522,10 @@ for (const gk of gatekeepers) {
     config.assets = {
       directory: "../workshop-frontend/dist",
       not_found_handling: "single-page-application",
-      run_worker_first: ["/api", "/api/*", "/blueprint-screenshot/*"],
+      // `/mcp` belongs here for the same reason `/api` does: the asset server answers anything it
+      // is given first, and it only serves GET/HEAD -- so without this an MCP POST is refused with
+      // a 405 before the Worker ever sees it.
+      run_worker_first: ["/api", "/api/*", "/mcp", "/mcp/*", "/blueprint-screenshot/*"],
     };
   }
 

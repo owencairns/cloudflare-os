@@ -20,6 +20,7 @@
     "@earendil-works/pi-ai": "0.83.0",
     "@gadgets/backend-utils": "workspace:*",
     "@gadgets/error-reporting": "workspace:*",
+    "@gadgets/mcp-server": "workspace:*",
     "@gadgets/typed-storage": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
     "capnweb": "catalog:",
