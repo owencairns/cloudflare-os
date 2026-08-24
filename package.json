@@ -20,7 +20,13 @@
     "types:check": "pnpm run build",
     "types:scripts": "tsc -p scripts/tsconfig.json",
     "lint": "pnpm run lint:check && pnpm run types:scripts && pnpm run types:check",
-    "types:generate": "node scripts/generate-worker-types.ts"
+    "types:generate": "node scripts/generate-worker-types.ts",
+    "os-client": "node scripts/os-client/index.ts"
+  },
+  "dependencies": {
+    "@gadgets/workshop-shared": "workspace:*",
+    "capnweb": "catalog:",
+    "hash-wasm": "^4.12.0"
   },
   "devDependencies": {
     "@types/node": "26.1.0",
