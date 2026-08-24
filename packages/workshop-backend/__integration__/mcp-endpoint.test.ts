@@ -7,6 +7,8 @@
 import { exports } from "cloudflare:workers";
 import { newWebSocketRpcSession, type RpcStub } from "capnweb";
 import type { PublicApi } from "@gadgets/workshop-shared/api";
+import { AGENT_CREDENTIAL_PREFIX } from "@gadgets/workshop-shared/api";
+import { formatAgentCredential } from "../src/auth/credentials.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { MCP_PROTOCOL_VERSION } from "@gadgets/mcp-server/server";
 
@@ -14,6 +16,7 @@ const PASSWORD_HASH = new Uint8Array([1, 2, 3]);
 const ORIGIN = "https://workshop.invalid";
 
 let sessionToken: string;
+let username: string;
 
 async function connect(): Promise<RpcStub<PublicApi>> {
   const response = await exports.default.fetch(new Request(`${ORIGIN}/api`, {
@@ -77,6 +80,7 @@ describe("the /mcp endpoint", () => {
     const token = await publicApi.createAccount(name, name, PASSWORD_HASH);
     if (token === null) throw new Error("Failed to create the test account.");
     sessionToken = token;
+    username = name;
   });
 
   describe("transport and auth", () => {
@@ -310,6 +314,76 @@ describe("the /mcp endpoint", () => {
     it("lists outputs", async () => {
       const result = await callTool("outputs_list");
       expect(Array.isArray(result.outputs)).toBe(true);
+    });
+  });
+
+  // The scope story end to end: a real agent credential, minted with a real scope set, driving the
+  // real endpoint. Everything above this point runs on a browser session token, which is unscoped
+  // -- so without these the scope seam would be exercised only in its "allow everything" branch.
+  describe("agent credential scopes", () => {
+    /** The wire form of an agent credential granted exactly `scopes`. */
+    async function mint(label: string, scopes: string[]): Promise<string> {
+      const secret = await exports.UserDurableObject.getByName(username)
+          .mintAgentCredential(label, scopes);
+      return formatAgentCredential(username, secret);
+    }
+
+    it("filters tools/list down to what the credential's scopes allow", async () => {
+      const credential = await mint("read-only agent", ["read"]);
+
+      const full = (await rpc("tools/list")).body;
+      const scoped = (await rpc("tools/list", undefined, { token: credential })).body;
+
+      const names = (body: any) => (body.result.tools as any[]).map(tool => tool.name) as string[];
+      const fullNames = names(full);
+      const scopedNames = names(scoped);
+
+      // The read tools survive; the mutating and chat-sending ones are simply not offered, which is
+      // the point -- a model never sees a tool it would only be refused for calling.
+      expect(scopedNames).toContain("list_workspaces");
+      expect(scopedNames).toContain("read_files");
+      expect(scopedNames).toContain("read_chat");
+      expect(scopedNames).not.toContain("create_workspace");
+      expect(scopedNames).not.toContain("write_file");
+      expect(scopedNames).not.toContain("send_message");
+      expect(scopedNames.length).toBeLessThan(fullNames.length);
+    });
+
+    it("refuses a build tool called by a read-only credential", async () => {
+      const credential = await mint("read-only agent", ["read"]);
+
+      const { status, body } = await rpc(
+          "tools/call",
+          { name: "create_workspace", arguments: { title: "Should not exist" } },
+          { token: credential });
+
+      // A refusal is a tool error, not a protocol error: the client's model reads it and adapts.
+      expect(status).toBe(200);
+      expect(body.error).toBeUndefined();
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text).toContain("build");
+      expect(body.result.content[0].text).toContain("create_workspace");
+    });
+
+    it("lets a credential granted the scope through", async () => {
+      const credential = await mint("builder agent", ["read", "build"]);
+
+      const { body } = await rpc(
+          "tools/call",
+          { name: "create_workspace", arguments: { title: "Scoped build" } },
+          { token: credential });
+      expect(body.result.isError).toBeFalsy();
+
+      const workspaceId = JSON.parse(body.result.content[0].text).workspace.id as string;
+      await callTool("delete_workspace", { workspaceId });
+    });
+
+    it("rejects an agent credential presented without its prefix", async () => {
+      const credential = await mint("prefix test", ["read"]);
+      const stripped = credential.slice(AGENT_CREDENTIAL_PREFIX.length);
+
+      const { status } = await rpc("tools/list", undefined, { token: stripped });
+      expect(status).toBe(401);
     });
   });
 });

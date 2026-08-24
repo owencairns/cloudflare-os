@@ -9,7 +9,7 @@
 
 import { McpServer } from "@gadgets/mcp-server/server";
 import { handleStreamableHttp } from "@gadgets/mcp-server/transport";
-import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
+import type { AuthenticatedApi, SessionAuthInfo } from "@gadgets/workshop-shared/api";
 import { authenticateMcpRequest } from "./auth.js";
 import { authorizeTool, MCP_TOOLS, type McpToolContext } from "./tools.js";
 import { createWorkshopLogger } from "../observability.js";
@@ -44,11 +44,14 @@ const server = new McpServer<McpToolContext>({
 /** What the handler needs from the surrounding fetch handler to authenticate a request. */
 export type McpHandlerDeps = {
   /**
-   * Runs `PublicApi.authenticate(token)` for this request. Supplied by server.ts so this module
-   * doesn't have to know how a `PublicApiImpl` is constructed (or hold the `ExecutionContext` and
-   * `Env` that construction needs).
+   * Authenticates one credential for this request, returning the capability object and the
+   * `SessionAuthInfo` describing what it may exercise. Supplied by server.ts so this module doesn't
+   * have to know how the check is wired (or hold the `ExecutionContext` and `Env` it needs). The
+   * scopes it returns are what decides which tools this request can see and call.
    */
-  authenticateSessionToken: (token: string) => Promise<AuthenticatedApi>;
+  authenticateCredential: (token: string) => Promise<{
+    api: AuthenticatedApi; session: SessionAuthInfo;
+  }>;
 };
 
 /**

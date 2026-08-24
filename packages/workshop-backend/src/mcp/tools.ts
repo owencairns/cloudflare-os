@@ -9,8 +9,9 @@
 //
 // What is deliberately *not* here in v1: anything administrative (admin settings, featured
 // blueprints), the action approval queue, and collaborator/share-link management. Those are refused
-// unconditionally by not existing, because they are exactly the operations where an unscoped
-// credential would be most dangerous, and scopes don't exist yet.
+// unconditionally by not existing, because they are exactly the operations where a credential the
+// user did not think hard about would be most dangerous. Note that the `admin` scope therefore
+// names nothing in this table -- it gates `getAdminApi()` on the Cap'n Web side only.
 
 import {
   defineTool,
@@ -33,6 +34,7 @@ import type {
 import type { FileChange } from "@gadgets/workshop-shared/code-change";
 import { RpcStub, RpcTarget } from "capnweb";
 import { AGENT_RUNNING_ERROR_MESSAGE } from "../overseer.js";
+import type { AgentScope } from "@gadgets/workshop-shared/api";
 import type { McpPrincipal } from "./auth.js";
 
 /** Per-request context handed to every tool handler. */
@@ -44,6 +46,18 @@ export type McpToolContext = {
 
 export type McpTool = ToolDefinition<McpToolContext>;
 
+/**
+ * `defineTool` narrowed so a tool's `scopes` must come from the system-wide `AgentScope`
+ * vocabulary. The generic `ToolDefinition.scopes` is `readonly string[]` because the mcp-server
+ * package has no opinion about scopes; this deployment does, and a typo like `"code:write"` should
+ * be a compile error rather than a scope that silently never matches.
+ */
+function defineMcpTool(
+    def: Omit<ToolDefinition<McpToolContext>, "scopes"> & { scopes?: readonly AgentScope[] },
+): McpTool {
+  return defineTool<McpToolContext>(def);
+}
+
 // =======================================================================================
 // Scope enforcement seam
 
@@ -51,11 +65,14 @@ export type McpTool = ToolDefinition<McpToolContext>;
  * ==> THE SCOPE SEAM <== The single place tool authorization is decided. `McpServer` calls this for
  * every `tools/call` (before the handler runs) and for every entry of `tools/list`.
  *
- * Today it lets everything through, because every credential this deployment accepts is unscoped
- * (`McpPrincipal.scopes === null` -- see mcp/auth.ts). When OAuth-issued credentials start carrying
- * the scopes a user approved, the `scopes !== null` branch below is where they get checked, keyed
- * on exactly what `authenticate()` returns; declaring a requirement on a tool is then a matter of
- * setting `scopes: [...]` in its definition.
+ * A browser session token is unscoped (`scopes === null`) and passes everything. An agent
+ * credential carries the `AgentScope`s the user approved, and every tool declares which one it
+ * needs -- so a narrow credential both *sees* a shorter `tools/list` and is refused if it calls a
+ * tool anyway.
+ *
+ * This is a defence in depth, not the only defence: the same scopes are enforced a second time
+ * deeper down, at the capability seams in server.ts (`#requireScope`) and on the Overseer. A tool
+ * that slipped through here would still be refused there.
  *
  * Returning a string refuses the call with that reason; `undefined` allows it.
  */
@@ -63,7 +80,7 @@ export function authorizeTool(tool: McpTool, ctx: McpToolContext): string | unde
   let granted = ctx.principal.scopes;
   if (granted === null) return undefined;  // Unscoped credential: full authority.
 
-  let required = tool.scopes ?? [];
+  let required = (tool.scopes ?? []) as readonly AgentScope[];
   let missing = required.filter(scope => !granted.includes(scope));
   if (missing.length === 0) return undefined;
   return `This credential is missing the scope${missing.length > 1 ? "s" : ""} ` +
@@ -274,16 +291,39 @@ const workspaceIdParam = {
   description: "Workspace id, as returned by list_workspaces or create_workspace.",
 } as const;
 
+// ---------------------------------------------------------------------------------------
+// Scope vocabulary
+//
+// Tools declare requirements in the *system-wide* `AgentScope` vocabulary from
+// workshop-shared/src/api.ts -- the same four scopes a user approves when they connect an agent,
+// the same ones `AuthenticatedApiImpl.#requireScope()` and the Overseer check. There is exactly one
+// vocabulary; /mcp does not get a private one. The mapping this table uses:
+//
+//   read   list_workspaces, get_workspace, read_files, list_chats, read_chat, list_blueprints,
+//          outputs_list                          -- anything that only observes
+//   build  create_workspace, delete_workspace, create_gadget, write_file, accept_changes,
+//          publish_blueprint, install_blueprint  -- anything that mutates a workspace, its code,
+//                                                   or the blueprint library
+//   chat   send_message                          -- driving the agent, i.e. spending money and
+//                                                   taking actions in the user's name
+//   admin  (unused here)                         -- no administrative tool exists in v1
+//
+// `read_chat` is a read: it observes a thread's messages and does not start a turn. Only the
+// *sending* side of chat needs `chat`.
+//
+// Note that every workspace-scoped tool also needs `read` in practice, because `openGadget()` is
+// the seam that requires it. That is enforced at the seam rather than restated on each tool, so a
+// `build`-only credential is refused there rather than here -- correctly, just one layer later.
 export const MCP_TOOLS: readonly McpTool[] = [
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "list_workspaces",
     title: "List workspaces",
     description:
         "List every workspace the authenticated user can open, newest activity first. " +
         "A workspace is the top-level container: it holds gadgets (apps), chats, and outputs.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    scopes: ["workspaces:read"],
+    scopes: ["read"],
     handler: async (_args, ctx) => {
       let gadgets = await ctx.api.listGadgets();
       let sorted = gadgets.toSorted(
@@ -294,7 +334,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     },
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "create_workspace",
     title: "Create workspace",
     description:
@@ -308,7 +348,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["title"],
       additionalProperties: false,
     },
-    scopes: ["workspaces:write"],
+    scopes: ["build"],
     handler: async (args, ctx) => {
       let overseer = await ctx.api.newGadget() as unknown as Overseer;
       try {
@@ -321,7 +361,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     },
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "get_workspace",
     title: "Get workspace",
     description:
@@ -333,7 +373,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId"],
       additionalProperties: false,
     },
-    scopes: ["workspaces:read"],
+    scopes: ["read"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       // Metadata and chats are independent reads; the workpiece subscription is not, since it must
       // run to ready() before the others' results are useful to report together.
@@ -365,7 +405,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "delete_workspace",
     title: "Delete workspace",
     description:
@@ -377,14 +417,14 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId"],
       additionalProperties: false,
     },
-    scopes: ["workspaces:write"],
+    scopes: ["build"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       await overseer.deleteSelf();
       return textResult(`Deleted workspace ${args.workspaceId}.`);
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "create_gadget",
     title: "Create gadget",
     description:
@@ -406,7 +446,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "title"],
       additionalProperties: false,
     },
-    scopes: ["workspaces:write"],
+    scopes: ["build"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       // No chatId: the gadget is permanent immediately rather than provisional to a chat.
       let gadget = await overseer.createGadget(
@@ -421,7 +461,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "read_files",
     title: "Read gadget files",
     description:
@@ -437,7 +477,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "gadgetId"],
       additionalProperties: false,
     },
-    scopes: ["code:read"],
+    scopes: ["read"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       let gadgetId = args.gadgetId as WorkpieceId;
       let gadget = requireGadget(await listWorkpieces(overseer), gadgetId);
@@ -458,7 +498,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "write_file",
     title: "Write gadget file",
     description:
@@ -481,7 +521,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "gadgetId", "chatId", "path", "content"],
       additionalProperties: false,
     },
-    scopes: ["code:write"],
+    scopes: ["build"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       let gadgetId = args.gadgetId as WorkpieceId;
       let chatId = args.chatId as number;
@@ -554,7 +594,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "accept_changes",
     title: "Accept chat changes",
     description:
@@ -571,7 +611,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "chatId"],
       additionalProperties: false,
     },
-    scopes: ["code:write"],
+    scopes: ["build"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       let chatId = args.chatId as number;
       await requireChat(overseer, chatId);
@@ -604,7 +644,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "list_chats",
     title: "List chats",
     description: "List a workspace's chat threads, including whether each has proposed changes " +
@@ -615,7 +655,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId"],
       additionalProperties: false,
     },
-    scopes: ["chats:read"],
+    scopes: ["read"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       let chats = await overseer.listChats();
       return jsonResult({
@@ -633,7 +673,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "send_message",
     title: "Send chat message",
     description:
@@ -660,7 +700,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "text"],
       additionalProperties: false,
     },
-    scopes: ["chats:write"],
+    scopes: ["chat"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       // `null` is the API's "record the message, don't run an agent". Spelling that as a magic
       // string keeps the JSON Schema honest (an optional string, not a nullable one).
@@ -699,7 +739,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "read_chat",
     title: "Read chat history",
     description:
@@ -719,7 +759,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "chatId"],
       additionalProperties: false,
     },
-    scopes: ["chats:read"],
+    scopes: ["read"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       let chatId = args.chatId as number;
       let chat = await requireChat(overseer, chatId);
@@ -739,7 +779,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "publish_blueprint",
     title: "Publish blueprint",
     description:
@@ -756,7 +796,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["workspaceId", "gadgetId"],
       additionalProperties: false,
     },
-    scopes: ["blueprints:write"],
+    scopes: ["build"],
     handler: (args, ctx) => withWorkspace(ctx, args.workspaceId as string, async overseer => {
       let gadgetId = args.gadgetId as WorkpieceId;
       requireGadget(await listWorkpieces(overseer), gadgetId);
@@ -772,7 +812,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
     }),
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "install_blueprint",
     title: "Install blueprint",
     description:
@@ -794,7 +834,7 @@ export const MCP_TOOLS: readonly McpTool[] = [
       required: ["blueprintId"],
       additionalProperties: false,
     },
-    scopes: ["workspaces:write"],
+    scopes: ["build"],
     handler: async (args, ctx) => {
       let bindings =
           (args.bindings as Record<string, BlueprintBindingAssignment> | undefined) ?? {};
@@ -817,14 +857,14 @@ export const MCP_TOOLS: readonly McpTool[] = [
     },
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "list_blueprints",
     title: "List blueprints",
     description:
         "List the blueprints available to install: the user's own, the ones they have added to " +
         "their library, and the ones this deployment features.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    scopes: ["blueprints:read"],
+    scopes: ["read"],
     handler: async (_args, ctx) => {
       let [own, library, featured] = await Promise.all([
         ctx.api.listOwnBlueprints(),
@@ -835,14 +875,14 @@ export const MCP_TOOLS: readonly McpTool[] = [
     },
   }),
 
-  defineTool<McpToolContext>({
+  defineMcpTool({
     name: "outputs_list",
     title: "List outputs",
     description:
         "List everything the user's workspaces have produced -- documents, apps, and so on -- " +
         "across every workspace, so an output can be found without knowing which workspace made it.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    scopes: ["workspaces:read"],
+    scopes: ["read"],
     handler: async (_args, ctx) => {
       // The index is swept in from older workspaces a bounded number at a time, so a single call
       // can return a partial list with `catchingUp` set. Loop until it clears -- bounded, because a

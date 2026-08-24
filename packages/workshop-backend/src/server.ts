@@ -665,10 +665,52 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
   }
 }
 
-// Exported so the MCP endpoint can authenticate through exactly this class rather than growing a
-// second implementation of the token check (see src/mcp/handler.ts).
+/** An authenticated caller: the capability object, plus what the credential may exercise. */
+export type AuthenticatedSession = {
+  api: AuthenticatedApi;
+  /** The scopes and kind of the credential that opened this session. */
+  session: SessionAuthInfo;
+};
+
+/**
+ * Turns a credential into a session. The single implementation of the token check: both the Cap'n
+ * Web endpoint (via `PublicApi.authenticate()`) and the MCP endpoint (via src/mcp/auth.ts) come
+ * through here, so there is no second place the credential rules can drift.
+ *
+ * It is a free function rather than a method on `PublicApiImpl` because `PublicApi.authenticate()`
+ * returns only the `AuthenticatedApi` -- that is its RPC signature, and adding a second, wider
+ * method to an `RpcTarget` would put the `SessionAuthInfo` on the wire for anyone who can reach
+ * /api. The MCP endpoint needs the scopes to decide which tools to offer, and it runs in-process,
+ * so it calls this directly.
+ */
+async function authenticateCredential(
+    ctx: ExecutionContext, env: Env, users: DurableObjectNamespace<UserDurableObject>,
+    abortSession: (reason: Error) => void, token: string): Promise<AuthenticatedSession> {
+  let { username, secret, prefixed } = parseCredential(token);
+
+  let userId = users.idFromName(username);
+  let session = await users.get(userId).authenticate(secret);
+
+  // The prefix is an advertisement of what the bearer holds; the storage record is the authority.
+  // Refuse a credential whose two disagree rather than silently trusting either: a browser token
+  // dressed up with the agent prefix, or an agent credential presented without it, is a caller
+  // confusing itself at best and probing at worst.
+  if (prefixed !== (session.kind === "agent")) {
+    throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+  }
+
+  recordAnalytics(ctx, env, {
+    event_name: "user_authenticated",
+    user_id: userId.toString(),
+    source: session.kind === "agent" ? "agent_credential" : "session_token",
+  });
+  return { api: new AuthenticatedApiImpl(ctx, env, userId, abortSession, session), session };
+}
+
+// The MCP endpoint used to reach the token check through this class; it now shares
+// `authenticateCredential` above instead, which is the same check without the RPC surface.
 @validateRpc()
-export class PublicApiImpl extends RpcTarget implements PublicApi {
+class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
 
   constructor(private ctx: ExecutionContext, private env: Env,
@@ -713,25 +755,8 @@ export class PublicApiImpl extends RpcTarget implements PublicApi {
   }
 
   async authenticate(token: string): Promise<AuthenticatedApi> {
-    let { username, secret, prefixed } = parseCredential(token);
-
-    let userId = this.users.idFromName(username);
-    let session = await this.users.get(userId).authenticate(secret);
-
-    // The prefix is an advertisement of what the bearer holds; the storage record is the authority.
-    // Refuse a credential whose two disagree rather than silently trusting either: a browser token
-    // dressed up with the agent prefix, or an agent credential presented without it, is a caller
-    // confusing itself at best and probing at worst.
-    if (prefixed !== (session.kind === "agent")) {
-      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
-    }
-
-    recordAnalytics(this.ctx, this.env, {
-      event_name: "user_authenticated",
-      user_id: userId.toString(),
-      source: session.kind === "agent" ? "agent_credential" : "session_token",
-    });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession, session);
+    return (await authenticateCredential(
+        this.ctx, this.env, this.users, this.abortSession, token)).api;
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
@@ -856,14 +881,15 @@ export default {
 
     // The MCP endpoint, for external MCP clients. It sits beside /api rather than under it because
     // the path is part of the protocol's discovery story: a user pastes an instance origin and the
-    // client appends /mcp. Everything behind it runs through the same PublicApiImpl the Cap'n Web
-    // endpoint below uses -- see src/mcp/handler.ts.
+    // client appends /mcp. Everything behind it runs through the same `authenticateCredential` and
+    // the same `AuthenticatedApi` the Cap'n Web endpoint below uses -- see src/mcp/handler.ts.
     if (url.pathname === MCP_PATH) {
       // MCP is request/response over HTTP; there is no long-lived session to abort, so the
-      // abortSession hook the Cap'n Web path needs is a no-op here.
-      let publicApi = new PublicApiImpl(ctx, env, () => {});
+      // abortSession hook the Cap'n Web path needs is a no-op here. Unlike the Cap'n Web path this
+      // keeps the SessionAuthInfo: an agent credential's scopes decide which tools /mcp offers.
       return handleMcpRequest(req, url, {
-        authenticateSessionToken: (token) => publicApi.authenticate(token),
+        authenticateCredential: (token) => authenticateCredential(
+            ctx, env, ctx.exports.UserDurableObject, () => {}, token),
       });
     }
 

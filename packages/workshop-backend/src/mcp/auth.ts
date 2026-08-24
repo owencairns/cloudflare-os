@@ -17,13 +17,21 @@
 //     `/.well-known/oauth-protected-resource`. That path 404s until the next branch serves it, but
 //     the header a client keys off is correct from day one, so adding the metadata endpoints is
 //     purely additive.
-//   - Whatever a validator returns is an `McpPrincipal` carrying `scopes`. A session token's scopes
-//     are `null`, meaning "unscoped, everything the user can do" -- distinct from `[]`, which an
-//     OAuth credential with no approved scopes would carry. Tool dispatch already consults this
-//     (see mcp/tools.ts `authorizeTool`), so scoped credentials become enforceable without
-//     touching the tool table.
+//   - Whatever a validator returns is an `McpPrincipal` carrying `scopes`. A browser session
+//     token's scopes are `null`, meaning "unscoped, everything the user can do" -- distinct from
+//     `[]`, which a credential with no approved scopes would carry. Tool dispatch consults this
+//     (see mcp/tools.ts `authorizeTool`), so scoped credentials are enforceable without touching
+//     the tool table.
+//
+// **Scopes are real today.** An agent credential (`mpk_<username>:<secret>`, minted by
+// `UserDurableObject.mintAgentCredential()`) authenticates through the same call as a browser token
+// and its stored record carries the `AgentScope`s the user approved. Those scopes arrive here on
+// the `SessionAuthInfo` and become the principal's scopes verbatim; the OAuth validator, when it
+// lands, does the same thing with the scopes its authorization server issued. There is one scope
+// vocabulary across the whole system -- `AgentScope` -- and this is where /mcp joins it.
 
-import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
+import type { AgentScope, AuthenticatedApi, SessionAuthInfo } from "@gadgets/workshop-shared/api";
+import { AGENT_CREDENTIAL_PREFIX } from "@gadgets/workshop-shared/api";
 import { mcpResponse } from "@gadgets/mcp-server/transport";
 
 /** Where the protected-resource metadata will live (RFC 9728). Served by the OAuth branch. */
@@ -33,11 +41,11 @@ export const PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-re
 const AUTH_REALM = "MyoPlan OS";
 
 /**
- * How the caller proved who they are. Recorded because the two classes will not stay
- * interchangeable: an OAuth credential is scoped and revocable per client, a session token is the
- * user's whole account.
+ * How the caller proved who they are. Recorded because the classes are not interchangeable: a
+ * session token is the user's whole account, while an agent credential (and, later, an OAuth
+ * token) is scoped and revocable on its own.
  */
-export type McpCredentialKind = "session-token" | "oauth";
+export type McpCredentialKind = "session-token" | "agent-credential" | "oauth";
 
 /** An authenticated caller and the capability object their tools run against. */
 export type McpPrincipal = {
@@ -46,7 +54,7 @@ export type McpPrincipal = {
    * Scopes the credential carries, or `null` for an unscoped credential (the user's full
    * authority). See the note at the top of this file: `null` and `[]` mean different things.
    */
-  scopes: readonly string[] | null;
+  scopes: readonly AgentScope[] | null;
   /**
    * The same `AuthenticatedApi` the web UI holds -- not a parallel API surface. Every tool reaches
    * the instance through this and the stubs it hands out.
@@ -58,9 +66,13 @@ export type McpPrincipal = {
 export type McpAuthDeps = {
   /**
    * Runs `PublicApi.authenticate` semantics for a credential -- i.e. the same call the browser
-   * makes -- returning the authenticated capability object.
+   * makes -- returning the authenticated capability object *and* what the credential may exercise.
+   * Supplied by server.ts (`authenticateCredential`), which is the one implementation of the
+   * credential check.
    */
-  authenticateSessionToken: (token: string) => Promise<AuthenticatedApi>;
+  authenticateCredential: (token: string) => Promise<{
+    api: AuthenticatedApi; session: SessionAuthInfo;
+  }>;
 };
 
 export type McpAuthResult =
@@ -74,31 +86,41 @@ export type McpAuthResult =
  * confusing "unsupported credential").
  */
 type CredentialValidator = {
-  kind: McpCredentialKind;
+  /** What this validator produces, for the reader. The principal's own `kind` is authoritative. */
+  produces: McpCredentialKind | "session-token | agent-credential";
   matches: (credential: string) => boolean;
   authenticate: (credential: string, deps: McpAuthDeps) => Promise<McpPrincipal>;
 };
 
 const CREDENTIAL_VALIDATORS: readonly CredentialValidator[] = [
   {
-    kind: "session-token",
-    // The web UI's session token is `username:token` -- exactly one colon, both halves non-empty.
-    // An OAuth access token will not look like this, which is what lets the two coexist in one
-    // `Authorization: Bearer` header once the OAuth validator joins the list.
+    // Both credentials this deployment mints authenticate through one call, so one validator owns
+    // them: a browser session token is `username:secret`, an agent credential is the same with
+    // `mpk_` in front. Which one it turned out to be is decided by the *stored record*, not the
+    // prefix -- `authenticateCredential` rejects a credential whose prefix and record disagree --
+    // so the principal below reads its kind and scopes off the returned SessionAuthInfo.
+    produces: "session-token | agent-credential",
     matches: (credential) => {
-      let parts = credential.split(":");
+      let body = credential.startsWith(AGENT_CREDENTIAL_PREFIX)
+          ? credential.slice(AGENT_CREDENTIAL_PREFIX.length)
+          : credential;
+      let parts = body.split(":");
       return parts.length === 2 && parts[0]!.length > 0 && parts[1]!.length > 0;
     },
-    authenticate: async (credential, deps) => ({
-      kind: "session-token",
-      // A session token is the user's whole account: unscoped.
-      scopes: null,
-      api: await deps.authenticateSessionToken(credential),
-    }),
+    authenticate: async (credential, deps) => {
+      let { api, session } = await deps.authenticateCredential(credential);
+      return {
+        kind: session.kind === "agent" ? "agent-credential" : "session-token",
+        // A browser session is the user's whole account: unscoped, which `authorizeTool` reads as
+        // "allow everything". An agent credential carries exactly the scopes the user approved.
+        scopes: session.kind === "agent" ? session.scopes : null,
+        api,
+      };
+    },
   },
   // ==> The OAuth validator lands here. It will match an opaque bearer token, verify it against the
   //     authorization server's introspection (or its own signature), and return
-  //     `{kind: "oauth", scopes: <approved scopes>, api}`.
+  //     `{kind: "oauth", scopes: <approved scopes>, api}` -- the same `AgentScope` vocabulary.
 ];
 
 /** Parses `Authorization: Bearer <credential>`, case-insensitively on the scheme. */
