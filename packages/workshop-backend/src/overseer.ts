@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, AgentScope, createScopeError } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, composeCodeChange, diffFiles, transformCodeChange,
   validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -8161,11 +8161,17 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   /**
    * `notifyClosed` should be invoked when the return `Overseer` stub is disposed, which is used
    * by AuthenticatedApiImpl.#openGadgetInternal() to detect Durable Object disconnects.
+   *
+   * `sessionScopes`, when present, means the caller authenticated with an agent credential rather
+   * than a browser session, and names the scopes the user approved for it. It can only narrow what
+   * the permission graph already allows, never widen it: the effective role is computed first, then
+   * capped. Absent (a browser session) leaves every existing behaviour untouched.
    */
   async open(userId: string, profileId: string,
              notifyClosed: NativeRpcStub<() => void>,
              shareKey?: string,
-             configureObservers?: RpcStub<ObserverConfigCallback>): Promise<Overseer> {
+             configureObservers?: RpcStub<ObserverConfigCallback>,
+             sessionScopes?: readonly AgentScope[]): Promise<Overseer> {
     let firstOpen = !this.impl.ownerId;
     if (firstOpen) {
       // This Overseer hasn't been initialized yet.
@@ -8291,6 +8297,13 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       })();
     }
 
+    // Cap the role by the credential's scopes. An agent credential without "build" is handed the
+    // same restricted capability a "use" collaborator gets -- reusing the existing default-deny
+    // interface rather than adding a second, parallel notion of a read-only session.
+    if (sessionScopes && !sessionScopes.includes("build")) {
+      role = "use";
+    }
+
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
@@ -8299,7 +8312,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     return new OverseerClientInterface(
         this.impl, profileId, userId, isOwner, notifyClosed.dup(),
-        ensureCapsules);
+        ensureCapsules,
+        // Undefined for browser sessions; a "build" agent credential still needs "chat" before it
+        // may drive the agent, which is the one distinction the role model can't express.
+        sessionScopes && !sessionScopes.includes("chat"));
   }
 
   #getExternalChat(externalChatKey: string): ExternalChatRecord | undefined {
@@ -8972,11 +8988,25 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
               private notifyClosed: NativeRpcStub<() => void>,
               // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
               // this so ambient providers are attached when possible.
-               private slashCommandsReady: Promise<void>) {
+               private slashCommandsReady: Promise<void>,
+              // True only for an agent credential that was granted "build" but not "chat": it may
+              // edit the workspace, but not start or continue a conversation with the agent. See
+              // #requireChatScope().
+               private chatDenied = false) {
     super();
     this.#leavePresence = joinSessionPresence(
         this.impl, this.clientProfileId, "build", () => this.#getClientProfile());
     this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  // The "chat" scope's single enforcement point. It gates the three entrypoints that put new work
+  // in front of the agent -- newChat, sendChatMessage, and the attachment upload that feeds them --
+  // rather than every chat-adjacent method: reading history, retitling, and accepting changes are
+  // ordinary workspace access already covered by "build".
+  #requireChatScope(): void {
+    if (this.chatDenied) {
+      throw createScopeError("chat", "send messages to the agent in this workspace");
+    }
   }
 
   // We create a new stub for every call so that we don't have to worry about detecting when a
@@ -9788,6 +9818,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     attachment: ChatAttachmentUpload,
     modelId: string | null,
   ): Promise<ChatAttachmentHandle> {
+    this.#requireChatScope();
     let provider: AiModelConfig["provider"] | undefined;
     if (modelId !== null) {
       provider = (await retryOnDoReset(
@@ -9975,6 +10006,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
                 formats?: MessageFormatRef[]): Promise<number> {
+    this.#requireChatScope();
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
@@ -9985,6 +10017,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       chatId: number, message: string | SlashCommandRequest, chosenModelId: string | null,
       capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
       formats?: MessageFormatRef[]): Promise<void> {
+    this.#requireChatScope();
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.sendChatMessage(

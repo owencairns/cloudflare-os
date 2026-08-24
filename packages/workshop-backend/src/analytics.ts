@@ -95,7 +95,11 @@ export type ProductAnalyticsInput =
   | {
       event_name: "user_authenticated";
       user_id: string;
-      source: "password" | "cf_access" | "session_token";
+      /**
+       * How the session authenticated. "agent_credential" is a scoped, non-browser session (see
+       * auth/credentials.ts), kept distinct from "session_token" so agent traffic is separable.
+       */
+      source: "password" | "cf_access" | "session_token" | "agent_credential";
     }
   | {
       event_name: "blueprint_imported";

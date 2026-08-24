@@ -356,6 +356,103 @@ export const createAuthError = authErrors.create;
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
 
+// ---------------------------------------------------------------------------
+// Agent credentials — scoped, revocable sessions for non-browser callers
+// ---------------------------------------------------------------------------
+//
+// A login session is either a **browser** session (minted by password login or OAuth sign-in, which
+// carries the user's full authority) or an **agent** session (minted for a specific external agent
+// after the user approves a connection, carrying only the scopes they approved). The two are
+// distinguished on the wire by `AGENT_CREDENTIAL_PREFIX`, and in storage by the session record's
+// `kind`.
+//
+// There is deliberately no user-facing API for minting these. The only caller is the OAuth
+// authorization endpoint, which reaches `UserDurableObject.mintAgentCredential()` directly.
+
+/**
+ * Wire prefix distinguishing an agent credential from a browser session token. A browser token is
+ * `<username>:<base64>`; an agent credential is `mpk_<username>:<base64>`. The prefix lets
+ * `PublicApi.authenticate()` classify a credential before any storage lookup, and lets a caller
+ * holding the string tell at a glance what authority it carries.
+ */
+export const AGENT_CREDENTIAL_PREFIX = "mpk_";
+
+/**
+ * What an agent credential is allowed to do. Deliberately small, and each scope names a capability
+ * seam rather than a list of methods, so every check lives where the capability is handed out:
+ *
+ * - `read`  — open a workspace and read everything non-admin in it. Required to call `openGadget()`
+ *             at all; on its own it yields the same restricted `Overseer` capability a "use"-role
+ *             collaborator gets.
+ * - `build` — mutate: create workspaces and blueprints, edit code, change workspace settings.
+ *             Promotes the handed-out `Overseer` from the "use" capability to the full one.
+ * - `chat`  — send chat messages / drive the agent inside a workspace. Gated on the full
+ *             `Overseer`'s chat entrypoints, so `build` without `chat` may edit code but not run
+ *             the agent.
+ * - `admin` — obtain the deployment `AdminApi`. Only ever effective for a user who is already an
+ *             admin; the scope narrows authority, it never confers it.
+ *
+ * A browser session holds every scope implicitly (see `FULL_SCOPES`).
+ */
+export type AgentScope = "read" | "build" | "chat" | "admin";
+
+/** Every `AgentScope`, in the order they should be presented. */
+export const AGENT_SCOPES: readonly AgentScope[] = ["read", "build", "chat", "admin"];
+
+/** True if `value` names a known scope. Used to reject unknown scopes at the minting seam. */
+export function isAgentScope(value: unknown): value is AgentScope {
+  return typeof value === "string" && (AGENT_SCOPES as readonly string[]).includes(value);
+}
+
+/**
+ * How a session was obtained, and therefore how much authority it carries. A session recorded
+ * before agent credentials existed has no stored `kind` and is read as `"browser"`.
+ */
+export type SessionKind = "browser" | "agent";
+
+/** The scope set a browser session — and any legacy session record — carries. */
+export const FULL_SCOPES: readonly AgentScope[] = AGENT_SCOPES;
+
+/**
+ * What `PublicApi.authenticate()` learns about a credential: the seam every scope decision reads.
+ * Returned by `UserDurableObject.authenticate()` and threaded into the `AuthenticatedApi`
+ * implementation, which is the only thing that acts on it.
+ *
+ * A browser session reports `scopes: FULL_SCOPES`, so downstream code never special-cases the kind:
+ * it asks whether a scope is present and gets the right answer for both kinds.
+ */
+export type SessionAuthInfo = {
+  /** Which kind of credential authenticated. */
+  kind: SessionKind;
+  /** The scopes this session may exercise. Always `FULL_SCOPES` for a browser session. */
+  scopes: readonly AgentScope[];
+  /** The agent credential's label, for logging and audit. Absent for browser sessions. */
+  label?: string;
+};
+
+/** True if `info` may exercise `scope`. */
+export function hasScope(info: SessionAuthInfo, scope: AgentScope): boolean {
+  return info.scopes.includes(scope);
+}
+
+/**
+ * True if `info` carries the user's undiminished authority — a browser session, or an agent
+ * credential granted every scope. Guards operations that mint or revoke authority, which a
+ * narrowed credential must never reach.
+ */
+export function isFullAuthority(info: SessionAuthInfo): boolean {
+  return AGENT_SCOPES.every(scope => info.scopes.includes(scope));
+}
+
+/**
+ * Builds the error thrown when a session lacks the scope a capability seam requires. `what`
+ * completes the sentence "…which is required to <what>."
+ */
+export function createScopeError(scope: AgentScope, what: string): Error {
+  return new Error(
+      `This connection was not granted the "${scope}" scope, which is required to ${what}.`);
+}
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
