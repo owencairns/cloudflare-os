@@ -453,10 +453,112 @@ export function createScopeError(scope: AgentScope, what: string): Error {
       `This connection was not granted the "${scope}" scope, which is required to ${what}.`);
 }
 
+/**
+ * What each scope means in the user's language, for the connect-an-agent approval screen.
+ *
+ * Kept next to `AgentScope` rather than in the frontend so the sentence a user approves and the
+ * check the tool seam later enforces cannot drift apart: adding a scope to the union without
+ * describing it here is a type error.
+ */
+export const AGENT_SCOPE_DESCRIPTIONS: Record<AgentScope, { title: string; detail: string }> = {
+  read: {
+    title: "See workspaces and read code/docs",
+    detail: "Open your workspaces and read their files, chats, blueprints and outputs.",
+  },
+  build: {
+    title: "Create and modify workspaces, code, and blueprints",
+    detail: "Create and delete workspaces, write and accept code changes, and manage blueprints.",
+  },
+  chat: {
+    title: "Send messages and drive the agent",
+    detail: "Post messages into chats and start agent turns, which may run tools and spend credits.",
+  },
+  admin: {
+    title: "Administer the deployment",
+    detail: "Reach deployment-wide admin settings. Only effective if you are already an admin.",
+  },
+};
+
+/**
+ * One agent connection as the Settings page shows it: an agent-kind session, named by the OAuth
+ * `client_name` that created it. `tokenId` is the session's token *hash*, so it is safe to publish
+ * and is the handle revocation takes.
+ *
+ * There is no counterpart for creating one. Agent connections exist only as the outcome of the
+ * OAuth flow, which is the deployment's single answer to "how does an agent connect".
+ */
+export type AgentConnectionInfo = {
+  tokenId: string;
+  /** The `client_name` the client registered, shown as the connection's name. */
+  label: string;
+  scopes: readonly AgentScope[];
+  created: Date;
+  lastUsed?: Date;
+  expiresAt?: Date;
+};
+
+/**
+ * A pending OAuth authorization, as the approval page renders it. Everything here came from the
+ * client's authorization request and has been validated already; the page's job is only to show it
+ * and collect a decision.
+ */
+export type AgentAuthorizationRequest = {
+  /** Opaque handle for this request, as carried in the approval page's URL. */
+  requestId: string;
+  /** The registered `client_name`. Client-supplied text -- render it, never trust it. */
+  clientName: string;
+  /** Where the user will be sent back to, shown so they can see who they are talking to. */
+  redirectUri: string;
+  /** Scopes the client asked for, canonically ordered. */
+  requestedScopes: readonly AgentScope[];
+  /**
+   * Scopes the page may actually offer: `requestedScopes` minus any the user cannot grant. Today
+   * that is `admin` for a non-admin user, filtered here rather than in the page so the rule lives
+   * with the authority that knows it.
+   */
+  grantableScopes: readonly AgentScope[];
+};
+
+/** The user's answer to an {@link AgentAuthorizationRequest}. */
+export type AgentAuthorizationDecision =
+    | { approve: true; scopes: AgentScope[] }
+    | { approve: false };
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
   whoami(): Promise<AiChatAuthorInfo>;
+
+  /**
+   * List this account's agent connections (OAuth-granted credentials), newest first. Browser
+   * sessions are not included: they are not connections the user manages here.
+   *
+   * Browser sessions only -- an agent must not be able to enumerate its siblings.
+   */
+  listAgentConnections(): Promise<AgentConnectionInfo[]>;
+
+  /**
+   * Revoke one agent connection by its `tokenId`, returning whether one was removed. Refuses to
+   * touch a browser session, so this can never log the user out of their own browser.
+   *
+   * Browser sessions only.
+   */
+  revokeAgentConnection(tokenId: string): Promise<boolean>;
+
+  /**
+   * Read a pending OAuth authorization request, or null if it is unknown or expired. Drives the
+   * approval page; browser sessions only, since approving is minting.
+   */
+  getAgentAuthorizationRequest(requestId: string): Promise<AgentAuthorizationRequest | null>;
+
+  /**
+   * Record the user's decision on a pending authorization request and return the URL to send the
+   * browser to -- the client's `redirect_uri` with either `code` + `state`, or `error=access_denied`.
+   *
+   * Consumes the request either way, so a decision cannot be replayed. Browser sessions only.
+   */
+  decideAgentAuthorization(
+      requestId: string, decision: AgentAuthorizationDecision): Promise<string>;
 
   /** Set the user's own display name, seen in chats, etc. */
   setOwnDisplayName(name: string): Promise<void>;

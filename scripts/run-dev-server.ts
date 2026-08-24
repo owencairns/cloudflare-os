@@ -525,7 +525,16 @@ for (const gk of gatekeepers) {
       // `/mcp` belongs here for the same reason `/api` does: the asset server answers anything it
       // is given first, and it only serves GET/HEAD -- so without this an MCP POST is refused with
       // a 405 before the Worker ever sees it.
-      run_worker_first: ["/api", "/api/*", "/mcp", "/mcp/*", "/blueprint-screenshot/*"],
+      // The OAuth paths are here for the same reason again: registration and the token exchange
+      // are POSTs, and discovery is a GET the asset server would answer with the SPA's HTML.
+      // `/oauth/approve` is deliberately excluded -- it *is* the single-page app.
+      run_worker_first: [
+        "/api", "/api/*", "/mcp", "/mcp/*",
+        "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/*",
+        "/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/*",
+        "/oauth/register", "/oauth/authorize", "/oauth/token",
+        "/blueprint-screenshot/*",
+      ],
     };
   }
 

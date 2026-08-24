@@ -9,6 +9,8 @@ export type WorkshopObservabilityFields = {
   blueprintId: string;
   callbackInitiated: boolean;
   chatId: number;
+  /** An OAuth client_id, as issued by dynamic client registration. */
+  clientId: string;
   commitCount: number;
   durableObjectId: string;
   durationMs: number;
@@ -25,6 +27,8 @@ export type WorkshopObservabilityFields = {
   path: string;
   resourceTitle: string;
   sequence: number;
+  /** A space-delimited AgentScope set, as granted by an OAuth authorization. */
+  scopes: string;
   size: number;
   status: number;
   statusCode: number;

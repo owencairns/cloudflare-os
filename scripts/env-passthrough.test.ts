@@ -63,6 +63,9 @@ const EXPECTED: Record<string, ExpectedArea> = {
   },
   "packages/workshop-backend": {
     uncached: ["FORMAT_BLUEPRINTS_DIR"],
+    // `BASE` picks the origin the live smoke scripts (scripts/mcp-smoke.mjs, scripts/oauth-smoke.mjs)
+    // drive. Those are run by hand against a local instance, never as a vp task.
+    external: ["BASE"],
   },
   // `build-gatekeeper-configurator.ts` is covered in detail by
   // build-gatekeeper-configurator.test.ts, which pins its reads against the shared task's `env`.
@@ -73,7 +76,8 @@ const EXPECTED: Record<string, ExpectedArea> = {
       "CF_ACCESS_AUD", "CF_ACCESS_ISS", "CF_AI_GATEWAY", "CF_AI_GATEWAY_ACCOUNT_ID",
       "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_USE_BINDING",
       "CI_COMMIT_SHA", "CI_PIPELINE_IID", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
-      "GITHUB_REPOSITORY", "GITHUB_TOKEN", "PREVIEW_ADMINS", "PREVIEW_NAME",
+      "GITHUB_REPOSITORY", "GITHUB_TOKEN", "OS_PASSWORD", "OS_TOKEN", "OS_URL",
+      "PREVIEW_ADMINS", "PREVIEW_NAME",
       "PREVIEW_PR_NUMBER", "PREVIEW_WORKERS_DEV_HOST", "PREVIEW_WRANGLER", "VITE_BACKEND_HOST",
     ],
   },

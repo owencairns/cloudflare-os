@@ -973,6 +973,15 @@
         "run_worker_first": [
           "/api",
           "/api/*",
+          "/mcp",
+          "/mcp/*",
+          "/.well-known/oauth-protected-resource",
+          "/.well-known/oauth-protected-resource/*",
+          "/.well-known/oauth-authorization-server",
+          "/.well-known/oauth-authorization-server/*",
+          "/oauth/register",
+          "/oauth/authorize",
+          "/oauth/token",
           "/blueprint-screenshot",
           "/blueprint-screenshot/*",
           "/gatekeeper/*"
@@ -1105,6 +1114,12 @@
             "PendingLogin"
           ],
           "tag": "v2"
+        },
+        {
+          "new_sqlite_classes": [
+            "OAuthProvider"
+          ],
+          "tag": "v3"
         }
       ],
       "modules": [

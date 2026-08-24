@@ -26,6 +26,16 @@
       "/api/*",
       "/mcp",
       "/mcp/*",
+      // The OAuth authorization server (see packages/workshop-backend/src/auth/oauth/). The
+      // well-known prefixes cover the spec's path-inserted variants. `/oauth/approve` is absent on
+      // purpose: the approval screen is a frontend route and must be served from assets.
+      "/.well-known/oauth-protected-resource",
+      "/.well-known/oauth-protected-resource/*",
+      "/.well-known/oauth-authorization-server",
+      "/.well-known/oauth-authorization-server/*",
+      "/oauth/register",
+      "/oauth/authorize",
+      "/oauth/token",
       "/blueprint-screenshot",
       "/blueprint-screenshot/*",
       "/gatekeeper/*"
