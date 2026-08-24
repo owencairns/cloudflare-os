@@ -27,6 +27,7 @@ import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
 import { resolveUiFeatureFlags } from "./feature-flags";
 import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
+import { handleMcpRequest, MCP_PATH } from "./mcp/handler.js";
 import { createWorkshopLogger } from "./observability";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
 
@@ -632,8 +633,10 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
   }
 }
 
+// Exported so the MCP endpoint can authenticate through exactly this class rather than growing a
+// second implementation of the token check (see src/mcp/handler.ts).
 @validateRpc()
-class PublicApiImpl extends RpcTarget implements PublicApi {
+export class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
 
   constructor(private ctx: ExecutionContext, private env: Env,
@@ -811,6 +814,19 @@ export default {
 
     if (url.pathname === "/api/client-errors") {
       return handleClientErrorRequest(req, env, ctx);
+    }
+
+    // The MCP endpoint, for external MCP clients. It sits beside /api rather than under it because
+    // the path is part of the protocol's discovery story: a user pastes an instance origin and the
+    // client appends /mcp. Everything behind it runs through the same PublicApiImpl the Cap'n Web
+    // endpoint below uses -- see src/mcp/handler.ts.
+    if (url.pathname === MCP_PATH) {
+      // MCP is request/response over HTTP; there is no long-lived session to abort, so the
+      // abortSession hook the Cap'n Web path needs is a no-op here.
+      let publicApi = new PublicApiImpl(ctx, env, () => {});
+      return handleMcpRequest(req, url, {
+        authenticateSessionToken: (token) => publicApi.authenticate(token),
+      });
     }
 
     if (url.pathname === "/api") {

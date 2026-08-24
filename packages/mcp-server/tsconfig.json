@@ -1,0 +1,21 @@
+// The MCP *server* side of the protocol. Deliberately free of Cloudflare types: this package knows
+// JSON-RPC, the Streamable HTTP transport, and tool dispatch, and nothing about how the instance it
+// fronts is implemented. (Contrast mcp-shared, which types against the Workers runtime because it
+// is the client half wired into gatekeepers.)
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    // `DOM` is here for `Request`/`Response`/`BodyInit` only -- the standard fetch types the
+    // transport speaks. It is *not* an admission that this runs in a browser; it is the one lib
+    // that declares those globals without dragging in a runtime's own type package. Compiled as
+    // part of the Worker (via the backend's tsconfig `paths`), the same code binds to workerd's
+    // declarations instead, which are structurally the same.
+    "lib": ["ESNext", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": []
+  },
+  "include": ["src"],
+  "exclude": ["dist", "node_modules"]
+}

@@ -24,6 +24,8 @@
     "run_worker_first": [
       "/api",
       "/api/*",
+      "/mcp",
+      "/mcp/*",
       "/blueprint-screenshot",
       "/blueprint-screenshot/*",
       "/gatekeeper/*"
