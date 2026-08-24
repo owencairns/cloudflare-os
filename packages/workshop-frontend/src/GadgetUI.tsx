@@ -268,6 +268,28 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     setIframeGeneration(generation => generation + 1)
   }
 
+  // DIAGNOSIS (unfixed): this is the prime suspect for the intermittent blank gadget iframe on a
+  // fresh navigation to /workspace/<id>, which a reload always clears.
+  //
+  // The branch below fires when `gadget` changes while a handshake is still in flight. It cannot
+  // reconnect (there is no session yet to redirect) and it must not let the handler finish, because
+  // the handler already called `connectToGadget` on the *previous* gadget -- so it throws the iframe
+  // away and starts over. The trouble is that starting over re-enters the same window: the fresh
+  // iframe posts a new handshake, and if `gadget` churns once more before that one settles, this
+  // branch fires again. The iframe is blank for as long as the churn lasts, and nothing here damps
+  // the loop -- it ends only when the props happen to go quiet.
+  //
+  // That matches every part of the repro. On a fresh navigation the stub is still settling as the
+  // editor wires up, so identity churn right after mount is exactly when it is likely; on reload the
+  // stub is stable before the iframe ever mounts, so the branch never runs. /gadget/<id> renders for
+  // the same reason: GadgetUseView passes a settled `gadget` and no `chatId` at all, while
+  // GadgetEditor passes both `chatId={previewChatId}` and a stub derived from the live overseer.
+  //
+  // The fix is NOT to drop the reload -- the staleness it guards against is real. It is to let the
+  // pending handshake complete and then run the redirect path below against it, i.e. treat "gadget
+  // changed mid-handshake" as a deferred reconnect rather than a restart. That reorders this
+  // component's connection lifecycle, so it wants a browser repro to verify rather than a blind
+  // edit, and it is deliberately left out of the theming change that touched this file.
   useEffect(() => {
     if (!rpcSessionRef.current) {
       if (handshakePendingRef.current !== null) {
