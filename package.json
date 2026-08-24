@@ -1,5 +1,5 @@
 {
-  "name": "cloudflare-os",
+  "name": "myoplan-os",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -7,7 +7,7 @@
   "scripts": {
     "build": "vp run -r --cache build",
     "run-local": "node scripts/run-local.ts",
-    "test": "node --test 'scripts/**/*.test.ts' && vp run --filter '!cloudflare-os' --cache test",
+    "test": "node --test 'scripts/**/*.test.ts' && vp run --filter '!myoplan-os' --cache test",
     "preview:config": "node scripts/preview/preview.ts config",
     "preview:deploy": "node scripts/preview/preview.ts deploy",
     "preview:delete": "node scripts/preview/preview.ts delete",
