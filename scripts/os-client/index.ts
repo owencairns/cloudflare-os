@@ -35,6 +35,8 @@ Commands:
                                                       publish a gadget as a blueprint
   blueprint:install <blueprintId>                    instantiate a workspace from a blueprint
   outputs:list                                       list all workspace outputs
+  rpc <wsId> <method> [jsonArg ...]                  call a gadget's own RPC method (Tasks/Docs/
+                                                      Memory agent API); args are JSON values
   admin:signups <on|off>                             toggle account signups (admin only)
 `;
 }
@@ -164,6 +166,19 @@ async function main(): Promise<void> {
       const state = need(positional[0], "usage: os-client admin:signups <on|off>");
       if (state !== "on" && state !== "off") throw new Error("admin:signups expects 'on' or 'off'");
       result = await cmds.adminSignups(state === "on");
+      break;
+    }
+    case "rpc": {
+      const wsId = need(positional[0], "usage: os-client rpc <wsId> <method> [jsonArg ...]");
+      const method = need(positional[1], "usage: os-client rpc <wsId> <method> [jsonArg ...]");
+      const args = positional.slice(2).map((raw, i) => {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          throw new Error(`rpc arg #${i + 1} is not valid JSON: ${raw}`);
+        }
+      });
+      result = await cmds.gadgetRpc(wsId, method, args);
       break;
     }
     default:

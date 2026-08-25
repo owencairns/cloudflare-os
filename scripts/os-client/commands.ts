@@ -374,3 +374,46 @@ export async function adminSignups(enabled: boolean): Promise<unknown> {
     disposeQuietly(pub);
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// gadget RPC — the agent API for first-party gadgets (Tasks / Docs / Memory)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Calls a method on a gadget's own RPC surface: `openGadget(ws)` → `getGadget(0)` →
+ * `connectToGadget()` → `stub[method](...args)`.
+ *
+ * This is how agents drive the first-party gadgets from a terminal (the /mcp endpoint only
+ * exposes platform-level tools — workspaces, gadgets, files — not these surfaces).
+ */
+export async function gadgetRpc(
+  wsId: string,
+  method: string,
+  args: unknown[],
+  gadgetIndex = 0,
+): Promise<unknown> {
+  const { pub, auth } = await connectAuthenticated();
+  try {
+    const overseer = await auth.openGadget(wsId);
+    try {
+      const gadget = await overseer.getGadget(gadgetIndex);
+      try {
+        const api = (await gadget.connectToGadget()) as RpcStub<Record<string, (...a: unknown[]) => Promise<unknown>>>;
+        try {
+          // NB: call through the proxy directly. `fn.apply(...)` would send an "apply"
+          // call over the wire (Cap'n Web stubs are proxies), not invoke the method.
+          const target = api as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+          return await target[method](...args);
+        } finally {
+          disposeQuietly(api as RpcStub<unknown>);
+        }
+      } finally {
+        disposeQuietly(gadget);
+      }
+    } finally {
+      disposeQuietly(overseer);
+    }
+  } finally {
+    disposeQuietly(pub);
+  }
+}
