@@ -235,6 +235,42 @@ describe("the OAuth agent-connect flow", () => {
       expect(status).toBe(400);
       expect(body.error).toBe("invalid_client_metadata");
     });
+
+    it("accepts the exact payload Claude Code sends, and reports what it registered", async () => {
+      // The real-world interop bug: this used to 400 with `invalid_client_metadata`, because the
+      // client asks for refresh_token and the validator demanded an exact match. RFC 7591 §3.2.1
+      // says register the supported subset and report it back, which is what these fields are.
+      const { status, body } = await register({
+        client_name: "Claude Code",
+        redirect_uris: ["http://localhost:57321/callback"],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      });
+      expect(status).toBe(201);
+      expect(typeof body.client_id).toBe("string");
+      expect(body.grant_types).toEqual(["authorization_code"]);
+      expect(body.response_types).toEqual(["code"]);
+      expect(body.token_endpoint_auth_method).toBe("none");
+      expect(body.client_secret).toBeUndefined();
+    });
+
+    it("accepts a private-use scheme redirect from a desktop client", async () => {
+      const { status, body } = await register({
+        client_name: "Desktop Client", redirect_uris: ["com.example.editor:/oauth/callback"],
+      });
+      expect(status).toBe(201);
+      expect(body.redirect_uris).toEqual(["com.example.editor:/oauth/callback"]);
+    });
+
+    it("refuses a client that cannot use the authorization_code grant at all", async () => {
+      const { status, body } = await register({
+        client_name: "Refresh Only", redirect_uris: [REDIRECT_URI],
+        grant_types: ["refresh_token"],
+      });
+      expect(status).toBe(400);
+      expect(body.error).toBe("invalid_client_metadata");
+    });
   });
 
   describe("the authorization endpoint", () => {
@@ -443,6 +479,35 @@ describe("the OAuth agent-connect flow", () => {
       const { body, status } = await token({ grant_type: "refresh_token", refresh_token: "x" });
       expect(status).toBe(400);
       expect(body.error).toBe("unsupported_grant_type");
+    });
+
+    it("answers a client that registered asking for refresh_token cleanly", async () => {
+      // Registration no longer refuses that client, so this is where it learns -- and it must be
+      // RFC 6749 §5.2's own code with an explanation, not a crash or a bare invalid_request.
+      const { body: registration } = await register({
+        client_name: "Refresh Hopeful", redirect_uris: [REDIRECT_URI],
+        grant_types: ["authorization_code", "refresh_token"],
+      });
+      expect(registration.grant_types).toEqual(["authorization_code"]);
+      const { status, body } = await token({
+        grant_type: "refresh_token", refresh_token: "whatever",
+        client_id: registration.client_id,
+      });
+      expect(status).toBe(400);
+      expect(body.error).toBe("unsupported_grant_type");
+      expect(body.error_description).toMatch(/no refresh tokens/);
+    });
+
+    it("returns no expiry and no refresh token on a successful exchange", async () => {
+      // The other half of the coherence story: nothing in the response implies refreshability.
+      const { clientId, code, verifier } = await authorizeAndApprove({ seed: "verifier-noexp" });
+      const { status, body } = await token({
+        grant_type: "authorization_code", code, client_id: clientId, code_verifier: verifier,
+        redirect_uri: REDIRECT_URI,
+      });
+      expect(status).toBe(200);
+      expect(body.refresh_token).toBeUndefined();
+      expect(body.expires_in).toBeUndefined();
     });
 
     it("rejects a client that sends a secret", async () => {

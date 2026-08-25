@@ -75,9 +75,32 @@ describe("redirect URI rules", () => {
     expect(isAllowedRedirectUri("")).toBe(false);
   });
 
-  it("refuses custom application schemes today", () => {
-    // Deliberate, and the single place to change if desktop clients need it.
-    expect(isAllowedRedirectUri("cursor://anysphere.cursor-mcp/oauth/cb")).toBe(false);
+  it("accepts a private-use application scheme (RFC 8252 §7.1)", () => {
+    // A reverse-domain scheme is claimable by exactly one party, and the OS hands the redirect to a
+    // locally installed app rather than putting it on a network.
+    expect(isAllowedRedirectUri("com.example.app:/oauth/callback")).toBe(true);
+    expect(isAllowedRedirectUri("com.example.app:oauth/callback")).toBe(true);
+    expect(isAllowedRedirectUri("app.myoplan.desktop://auth/cb")).toBe(true);
+  });
+
+  it("accepts the short editor schemes that predate that advice", () => {
+    // These clients exist and are the reason this server has an OAuth flow at all.
+    expect(isAllowedRedirectUri("cursor://anysphere.cursor-mcp/oauth/cb")).toBe(true);
+    expect(isAllowedRedirectUri("vscode://mcp/callback")).toBe(true);
+    expect(isAllowedRedirectUri("zed://oauth/cb")).toBe(true);
+  });
+
+  it("still refuses anything that could be an open redirector or a script URL", () => {
+    // Default-deny: an unrecognised bare scheme is not claimable by anyone in particular, so it is
+    // not evidence that the redirect reaches the client that registered it.
+    expect(isAllowedRedirectUri("myapp://cb")).toBe(false);
+    expect(isAllowedRedirectUri("javascript:alert(1)")).toBe(false);
+    expect(isAllowedRedirectUri("data:text/html,<script>")).toBe(false);
+    expect(isAllowedRedirectUri("file:///etc/passwd")).toBe(false);
+    expect(isAllowedRedirectUri("ftp://files.example/cb")).toBe(false);
+    expect(isAllowedRedirectUri("ws://client.example/cb")).toBe(false);
+    // And a private-use scheme still may not carry a fragment.
+    expect(isAllowedRedirectUri("com.example.app:/cb#frag")).toBe(false);
   });
 });
 
@@ -112,19 +135,54 @@ describe("dynamic client registration (RFC 7591)", () => {
     expect(request.redirectUris).toHaveLength(1);
   });
 
-  it("refuses a client declaring capabilities this server does not implement", () => {
-    expect(() => validateRegistration({ ...good, grant_types: ["refresh_token"] }))
-        .toThrow(/authorization_code grant/);
-    expect(() => validateRegistration({ ...good, response_types: ["token"] }))
-        .toThrow(/"code" response type/);
-    expect(() => validateRegistration({ ...good, token_endpoint_auth_method: "client_secret_post" }))
-        .toThrow(/public clients only/);
+  it("registers the supported subset of a client that asks for more (RFC 7591 §3.2.1)", () => {
+    // The exact payload Claude Code sends. Asking for refresh_token is the normal shape for a
+    // client that wants long-lived access; refusing it was the interop bug this test now pins.
+    const request = validateRegistration({
+      ...good, grant_types: ["authorization_code", "refresh_token"], response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    });
+    expect(request.grantTypes).toEqual(["authorization_code"]);
+    expect(request.responseTypes).toEqual(["code"]);
+    expect(request.tokenEndpointAuthMethod).toBe("none");
   });
 
-  it("parses a declared scope, and rejects an unknown one", () => {
+  it("defaults the registered metadata when the client declares none", () => {
+    const request = validateRegistration(good);
+    expect(request.grantTypes).toEqual(["authorization_code"]);
+    expect(request.responseTypes).toEqual(["code"]);
+    expect(request.tokenEndpointAuthMethod).toBe("none");
+  });
+
+  it("registers a public client whatever authentication the client would have preferred", () => {
+    // There are no client secrets to issue, so this is not a negotiation with two outcomes -- but
+    // it is not a reason to refuse the registration either. The response tells the client what it
+    // got, which is how it learns not to send a secret to the token endpoint.
+    expect(validateRegistration({ ...good, token_endpoint_auth_method: "client_secret_post" })
+        .tokenEndpointAuthMethod).toBe("none");
+    expect(() => validateRegistration({ ...good, token_endpoint_auth_method: 7 }))
+        .toThrow(/must be a string/);
+  });
+
+  it("refuses a client that asks for none of what this server supports", () => {
+    // This one genuinely could not complete a flow here, so 400 is the honest answer.
+    expect(() => validateRegistration({ ...good, grant_types: ["refresh_token"] }))
+        .toThrow(/must include authorization_code/);
+    expect(() => validateRegistration({ ...good, grant_types: [] }))
+        .toThrow(/must include authorization_code/);
+    expect(() => validateRegistration({ ...good, response_types: ["token"] }))
+        .toThrow(/must include "code"/);
+    expect(() => validateRegistration({ ...good, grant_types: "authorization_code" }))
+        .toThrow(/must be an array of strings/);
+  });
+
+  it("keeps the scopes it knows from a declared scope, and drops the rest", () => {
+    // Registration-time scope is advisory; /oauth/authorize is where an unknown scope must fail.
     expect(validateRegistration({ ...good, scope: "read chat" }).scopes).toEqual(["read", "chat"]);
-    expect(() => validateRegistration({ ...good, scope: "read wildcard" }))
-        .toThrow(/Unknown scope/);
+    expect(validateRegistration({ ...good, scope: "read wildcard" }).scopes).toEqual(["read"]);
+    expect(validateRegistration({ ...good, scope: "wildcard" }).scopes).toBeUndefined();
+    // ... but it still fails there:
+    expect(() => parseScopeParameter("read wildcard")).toThrow(/Unknown scope/);
   });
 
   it("refuses a non-object body", () => {

@@ -15,6 +15,35 @@
 //     no gain, so `expires_in` is omitted from the token response and clients hold the credential
 //     until the user revokes it from Settings.
 //
+// **The refresh-token decision, and what makes it coherent.** Real MCP clients (Claude Code among
+// them) register asking for `grant_types: ["authorization_code", "refresh_token"]`, because that is
+// what a client wanting long-lived access normally has to ask for. We still do not implement
+// refresh tokens -- the credential is already long-lived, so a refresh grant would buy nothing and
+// cost a second expiry story -- but *asking* for one is no longer an error. Three things have to
+// agree for that to be honest rather than merely permissive, and they do:
+//
+//   1. Registration accepts a superset. RFC 7591 §2 and §3.2.1 say the server registers what it
+//      supports and *reports back what it registered*, which may differ from the request. So a
+//      request naming `refresh_token` registers `["authorization_code"]` and the 201 response says
+//      so. Only a request with no `authorization_code` at all is refused -- that client genuinely
+//      cannot complete a flow here.
+//   2. The metadata document advertises exactly what exists: `grant_types_supported` is
+//      `["authorization_code"]`, and nothing anywhere implies refreshability.
+//   3. The token response carries no `expires_in` and no `refresh_token`, and a client that sends
+//      `grant_type=refresh_token` anyway gets RFC 6749 §5.2's `unsupported_grant_type` with a 400 --
+//      the spec-correct answer, not a crash and not a confusing `invalid_request`.
+//
+// A client that reads any one of those three learns the truth; a client that reads none of them
+// still works, because the credential it holds never needs refreshing.
+//
+// **Registration validation is a negotiation, not a spelling test.** The same principle governs
+// every other piece of client metadata: `response_types`, `token_endpoint_auth_method` and the
+// declared `scope` are narrowed to what this server supports and echoed back as registered, rather
+// than 400ing a client whose only sin is being more capable than we are. `scope` at *registration*
+// is advisory (RFC 7591 §2 -- "scopes the client can use"), so unknown entries are dropped there;
+// `scope` at */oauth/authorize* is a real request, and an unknown entry still fails loudly, because
+// that is the one place a typo would quietly issue a different grant than the user believes.
+//
 // The scope vocabulary is `AgentScope` -- the same four scopes the tool seam enforces. There is no
 // OAuth-specific scope namespace to translate.
 
@@ -52,6 +81,16 @@ export const AUTHORIZATION_CODE_TTL_MS = 5 * 60 * 1000;
  * rather than the user's own workspaces.
  */
 export const DEFAULT_REQUESTED_SCOPES: readonly AgentScope[] = ["read", "build", "chat"];
+
+/**
+ * The one grant, the one response type, and the one client authentication method this server
+ * implements. Written once, here, because three separate places have to agree about them: the
+ * metadata document, what registration narrows a client's request down to, and what the
+ * registration response reports back as registered.
+ */
+export const SUPPORTED_GRANT_TYPES: readonly string[] = ["authorization_code"];
+export const SUPPORTED_RESPONSE_TYPES: readonly string[] = ["code"];
+export const SUPPORTED_TOKEN_ENDPOINT_AUTH_METHOD = "none";
 
 // ---------------------------------------------------------------------------------------------
 // Metadata documents
@@ -102,13 +141,14 @@ export function authorizationServerMetadata(origin: string): AuthorizationServer
     token_endpoint: `${origin}${TOKEN_PATH}`,
     registration_endpoint: `${origin}${REGISTER_PATH}`,
     scopes_supported: [...AGENT_SCOPES],
-    response_types_supported: ["code"],
-    // No refresh_token grant: see the note at the top of this file.
-    grant_types_supported: ["authorization_code"],
+    response_types_supported: [...SUPPORTED_RESPONSE_TYPES],
+    // No refresh_token grant: see the note at the top of this file. A client may *register* asking
+    // for one; this document is the authoritative statement that it will never get one.
+    grant_types_supported: [...SUPPORTED_GRANT_TYPES],
     // `plain` is deliberately absent. OAuth 2.1 requires S256 for public clients, and offering
     // `plain` would let a client downgrade itself.
     code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["none"],
+    token_endpoint_auth_methods_supported: [SUPPORTED_TOKEN_ENDPOINT_AUTH_METHOD],
     response_modes_supported: ["query"],
   };
 }
@@ -137,31 +177,72 @@ export class OAuthProtocolError extends Error {
 // Dynamic client registration (RFC 7591)
 // ---------------------------------------------------------------------------------------------
 
-/** What a registration request may say, once validated. */
+/**
+ * What a registration request says, *once narrowed to what this server actually registers*. The
+ * `grantTypes` / `responseTypes` / `tokenEndpointAuthMethod` fields are not echoes of the request:
+ * they are the registered values, which RFC 7591 §3.2.1 requires the 201 response to report and
+ * which may be narrower than what the client asked for.
+ */
 export type RegistrationRequest = {
   clientName: string;
   redirectUris: string[];
   /** The scopes the client says it will ask for. Advisory: each authorization asks again. */
   scopes?: AgentScope[];
+  /** Always `["authorization_code"]` today; see the refresh-token note at the top of this file. */
+  grantTypes: string[];
+  /** Always `["code"]` today. */
+  responseTypes: string[];
+  /** Always `"none"` today: this server issues no client secrets. */
+  tokenEndpointAuthMethod: string;
 };
 
-/** Longest `client_name` we will store and later show on the approval screen. */
+/**
+ * Longest `client_name` we will store and later show on the approval screen. A longer one is
+ * truncated rather than refused -- the name is a label on a consent screen, not a capability, and
+ * the registration response tells the client exactly what was stored.
+ */
 const MAX_CLIENT_NAME = 120;
+
+/**
+ * Schemes that are never acceptable as a redirect target, listed explicitly so the intent is
+ * visible even though the rule below is default-deny anyway. `http`/`https` are handled separately;
+ * the rest are either web-facing (and so could make this an open redirector) or are script/data
+ * URLs that must never be navigated to with an authorization code attached.
+ */
+const FORBIDDEN_REDIRECT_SCHEMES = new Set([
+  "ftp", "ws", "wss", "file", "data", "blob", "javascript", "vbscript", "about", "mailto",
+  "view-source", "filesystem", "chrome", "chrome-extension",
+]);
+
+/**
+ * Well-known desktop-client schemes that are not reverse-domain shaped. RFC 8252 §7.1 asks for a
+ * scheme the client controls via a domain it owns; these editors shipped short schemes before that
+ * advice settled, and refusing them would refuse the clients this server exists to serve.
+ */
+const KNOWN_APP_REDIRECT_SCHEMES = new Set([
+  "vscode", "vscode-insiders", "vscodium", "code-oss", "cursor", "windsurf", "zed", "trae",
+  "jetbrains", "idea", "fleet", "claude", "claude-code",
+]);
 /** Registering more than a handful of redirect URIs is a sign of a confused (or hostile) client. */
 const MAX_REDIRECT_URIS = 8;
 
 /**
  * Whether a redirect URI may be registered.
  *
- * Two shapes are allowed, and no others:
+ * Three shapes are allowed, and no others:
  *
  *   - `https://...`, for a hosted client;
  *   - `http://localhost...` / `http://127.0.0.1...` / `http://[::1]...`, for a client that spins up
- *     a loopback listener, which is how every desktop MCP client completes the flow.
+ *     a loopback listener, which is how most desktop MCP clients complete the flow;
+ *   - a **private-use URI scheme** per RFC 8252 §7.1 -- `com.example.app:/callback` -- plus the
+ *     handful of short editor schemes (`vscode:`, `cursor:`, ...) that predate that advice. The OS
+ *     hands one of these to a locally installed application, so the code never crosses a network.
  *
- * Plain `http` to any other host is refused: the authorization code would cross the network in
- * clear text. Custom application schemes (`vscode://`, `cursor://`) are *also* refused today --
- * see the deferral note in the branch's report; permitting them is a change to this function alone.
+ * Everything else is refused, and the rule is default-deny rather than a blocklist. In particular
+ * plain `http` to any host but loopback is refused, because the authorization code would cross the
+ * network in clear text; and a bare one-word scheme this server has never heard of is refused,
+ * because nothing about it can be traced to an owner -- an unclaimable scheme is a scheme an
+ * attacker's app can register too.
  *
  * A fragment is refused outright (RFC 6749 §3.1.2), since the redirect appends query parameters.
  */
@@ -174,9 +255,40 @@ export function isAllowedRedirectUri(value: string): boolean {
   }
   if (url.hash) return false;
   if (url.protocol === "https:") return true;
-  if (url.protocol !== "http:") return false;
-  return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]"
-      || url.hostname === "::1";
+  if (url.protocol === "http:") {
+    return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]"
+        || url.hostname === "::1";
+  }
+
+  let scheme = url.protocol.slice(0, -1).toLowerCase();
+  if (FORBIDDEN_REDIRECT_SCHEMES.has(scheme)) return false;
+  // RFC 8252 §7.1: a scheme derived from a domain name the client controls, which in practice means
+  // it contains a dot. That is what makes it *private-use* rather than a name anyone may squat.
+  if (scheme.includes(".")) return true;
+  return KNOWN_APP_REDIRECT_SCHEMES.has(scheme);
+}
+
+/**
+ * Narrow a client's declared list-valued metadata to what this server implements.
+ *
+ * RFC 7591 §2 lets the server register values that differ from those requested, and §3.2.1 makes
+ * the response the authoritative statement of what was registered. So the rule here is *intersect,
+ * do not match*: a client asking for more than we do gets the part we can do, and only a client
+ * asking for none of what we do is turned away -- it is the one that could never complete a flow.
+ */
+function narrowDeclaredMetadata(
+    raw: unknown, supported: readonly string[], field: string,
+    description: string): string[] {
+  if (raw === undefined) return [...supported];
+  if (!Array.isArray(raw) || raw.some(entry => typeof entry !== "string")) {
+    throw new OAuthProtocolError(
+        "invalid_client_metadata", `${field} must be an array of strings.`);
+  }
+  let registered = supported.filter(entry => (raw as string[]).includes(entry));
+  if (registered.length === 0) {
+    throw new OAuthProtocolError("invalid_client_metadata", description);
+  }
+  return registered;
 }
 
 /**
@@ -198,10 +310,9 @@ export function validateRegistration(body: unknown): RegistrationRequest {
         "invalid_client_metadata",
         "client_name is required: it is what the user sees when approving this connection.");
   }
-  if (clientName.length > MAX_CLIENT_NAME) {
-    throw new OAuthProtocolError(
-        "invalid_client_metadata", `client_name must be at most ${MAX_CLIENT_NAME} characters.`);
-  }
+  // Truncated, not refused: the approval screen has a finite amount of room, but a long name is
+  // not a reason a connection cannot be made. The response reports what was actually stored.
+  if (clientName.length > MAX_CLIENT_NAME) clientName = clientName.slice(0, MAX_CLIENT_NAME);
 
   let rawUris = record["redirect_uris"];
   if (!Array.isArray(rawUris) || rawUris.length === 0) {
@@ -217,43 +328,49 @@ export function validateRegistration(body: unknown): RegistrationRequest {
     if (typeof candidate !== "string" || !isAllowedRedirectUri(candidate)) {
       throw new OAuthProtocolError(
           "invalid_redirect_uri",
-          "Each redirect_uri must be an https URL, or an http URL on localhost.");
+          "Each redirect_uri must be an https URL, an http URL on localhost, or a private-use " +
+          "application scheme (RFC 8252 §7.1).");
     }
     if (!redirectUris.includes(candidate)) redirectUris.push(candidate);
   }
 
-  // RFC 7591 lets a client declare these; we accept only the ones this server implements rather
-  // than silently registering a client that can never complete a flow.
-  let grantTypes = record["grant_types"];
-  if (grantTypes !== undefined) {
-    if (!Array.isArray(grantTypes) ||
-        grantTypes.some(grant => grant !== "authorization_code")) {
-      throw new OAuthProtocolError(
-          "invalid_client_metadata",
-          "This server supports only the authorization_code grant.");
-    }
-  }
-  let responseTypes = record["response_types"];
-  if (responseTypes !== undefined) {
-    if (!Array.isArray(responseTypes) || responseTypes.some(type => type !== "code")) {
-      throw new OAuthProtocolError(
-          "invalid_client_metadata", "This server supports only the \"code\" response type.");
-    }
-  }
-  let authMethod = record["token_endpoint_auth_method"];
-  if (authMethod !== undefined && authMethod !== "none") {
+  // RFC 7591 §2 / §3.2.1: a client declares what it can do, the server registers the part it
+  // supports, and the response reports what was registered. A client asking for `refresh_token`
+  // alongside `authorization_code` is the normal case, not an error -- see the note at the top of
+  // this file for why it still never receives a refresh token.
+  let grantTypes = narrowDeclaredMetadata(
+      record["grant_types"], SUPPORTED_GRANT_TYPES, "grant_types",
+      "grant_types must include authorization_code, the only grant this server supports.");
+  let responseTypes = narrowDeclaredMetadata(
+      record["response_types"], SUPPORTED_RESPONSE_TYPES, "response_types",
+      "response_types must include \"code\", the only response type this server supports.");
+
+  // Not a negotiation with more than one outcome: this server has no client secrets to issue, so
+  // every registration is a public client whatever the request preferred. Reporting `"none"` back
+  // is how the client learns not to send one at the token endpoint. Only a value that is not even
+  // a string is refused, since that is a malformed request rather than an unsupported preference.
+  let rawAuthMethod = record["token_endpoint_auth_method"];
+  if (rawAuthMethod !== undefined && typeof rawAuthMethod !== "string") {
     throw new OAuthProtocolError(
-        "invalid_client_metadata",
-        "This server registers public clients only (token_endpoint_auth_method \"none\").");
+        "invalid_client_metadata", "token_endpoint_auth_method must be a string.");
   }
 
+  // Registration-time `scope` is advisory (RFC 7591 §2: the scopes the client *can* use), and each
+  // authorization asks for scopes again and is checked strictly there. So an unknown entry is
+  // dropped here rather than failing the registration -- a client that names some scope from
+  // another server's vocabulary should still be able to connect.
   let scopes: AgentScope[] | undefined;
   let rawScope = record["scope"];
   if (typeof rawScope === "string" && rawScope.trim()) {
-    scopes = parseScopeParameter(rawScope, "invalid_client_metadata");
+    let declared = rawScope.split(/\s+/).filter(part => part.length > 0);
+    let known = AGENT_SCOPES.filter(scope => declared.includes(scope));
+    if (known.length > 0) scopes = known;
   }
 
-  return { clientName, redirectUris, scopes };
+  return {
+    clientName, redirectUris, scopes, grantTypes, responseTypes,
+    tokenEndpointAuthMethod: SUPPORTED_TOKEN_ENDPOINT_AUTH_METHOD,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

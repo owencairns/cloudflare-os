@@ -103,6 +103,81 @@ let clientId;
   check("a plaintext non-loopback redirect is refused", bad.status === 400, `status ${bad.status}`);
 }
 
+// --- 4b. the exact payload a real MCP client sends ---
+//
+// This is a regression replay, not a hypothetical. Claude Code's MCP client sent precisely this
+// body to the deployed server and got back 400 invalid_client_metadata, because the validator
+// demanded `grant_types` be exactly ["authorization_code"] and the client, wanting long-lived
+// access, asks for refresh_token too. RFC 7591 §3.2.1: register the supported subset and *report
+// back what was registered*. So the assertion is both halves -- it succeeds, and the response tells
+// the client the truth about what it got.
+console.log("\n== step 4b: the real Claude Code registration payload ==");
+{
+  const payload = {
+    client_name: "Claude Code",
+    redirect_uris: ["http://localhost:57321/callback"],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+  };
+  console.log(`  --> POST ${metadata.registration_endpoint}`);
+  console.log(`      ${JSON.stringify(payload)}`);
+  const res = await fetch(metadata.registration_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json();
+  console.log(`  <-- ${res.status}`);
+  console.log(JSON.stringify(body, null, 2).split("\n").map(l => `      ${l}`).join("\n"));
+
+  check("Claude Code's registration is accepted (201)", res.status === 201, `status ${res.status}`);
+  check("a client_id was issued", typeof body.client_id === "string");
+  check("the registered grant_types are the supported subset",
+        JSON.stringify(body.grant_types) === '["authorization_code"]',
+        JSON.stringify(body.grant_types));
+  check("response_types echo back as [\"code\"]",
+        JSON.stringify(body.response_types) === '["code"]', JSON.stringify(body.response_types));
+  check("registered as a public client",
+        body.token_endpoint_auth_method === "none" && body.client_secret === undefined);
+  check("the name the user will be shown survived", body.client_name === "Claude Code");
+  check("the redirect it will listen on survived",
+        JSON.stringify(body.redirect_uris) === JSON.stringify(payload.redirect_uris));
+
+  // A desktop client that completes the flow through its own URL scheme rather than a loopback
+  // listener -- refused before this change, allowed now (RFC 8252 §7.1).
+  const custom = await fetch(metadata.registration_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_name: "Desktop Editor", redirect_uris: ["com.example.editor:/oauth/callback"],
+    }),
+  });
+  check("a private-use scheme redirect registers", custom.status === 201, `status ${custom.status}`);
+
+  // And the client that could never complete a flow here is still turned away.
+  const hopeless = await fetch(metadata.registration_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_name: "Refresh Only", redirect_uris: [REDIRECT_URI], grant_types: ["refresh_token"],
+    }),
+  });
+  check("a client with no authorization_code grant is refused",
+        hopeless.status === 400, `status ${hopeless.status}`);
+
+  // The refresh grant itself: a clean, spec-named error rather than a crash or a puzzle.
+  const refresh = await fetch(metadata.token_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: "nope" }).toString(),
+  });
+  const refreshBody = await refresh.json();
+  check("a refresh_token grant answers unsupported_grant_type at 400",
+        refresh.status === 400 && refreshBody.error === "unsupported_grant_type",
+        `${refresh.status} ${JSON.stringify(refreshBody)}`);
+}
+
 console.log("\n== step 5: authorize + approve ==");
 const verifier = "smoke-verifier".padEnd(64, "v");
 let code;

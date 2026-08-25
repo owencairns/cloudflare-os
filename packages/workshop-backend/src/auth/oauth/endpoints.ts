@@ -173,16 +173,19 @@ async function handleRegister(req: Request, deps: OAuthDeps): Promise<Response> 
     event: "oauth.client.registered", clientId: record.clientId,
   });
 
-  // RFC 7591 §3.2.1: 201, `client_id`, and the metadata as registered (which may differ from what
-  // was sent -- here, only in that unspecified fields are filled in with this server's one answer).
+  // RFC 7591 §3.2.1: 201, `client_id`, and the metadata **as registered**, which may legitimately
+  // differ from what was sent. That is the mechanism by which a client asking for more than this
+  // server does -- `refresh_token`, say -- learns what it actually got, rather than being refused
+  // for asking. So these three fields come from the narrowed registration, never from the raw
+  // request, and they are the authoritative answer for this client.
   return json({
     client_id: record.clientId,
     client_id_issued_at: Math.floor(record.createdAt.valueOf() / 1000),
     client_name: record.clientName,
     redirect_uris: record.redirectUris,
-    grant_types: ["authorization_code"],
-    response_types: ["code"],
-    token_endpoint_auth_method: "none",
+    grant_types: request.grantTypes,
+    response_types: request.responseTypes,
+    token_endpoint_auth_method: request.tokenEndpointAuthMethod,
     ...(record.scopes ? { scope: formatScopeParameter(record.scopes) } : {}),
   }, 201, { "Cache-Control": "no-store" });
 }
@@ -340,11 +343,16 @@ async function handleToken(req: Request, deps: OAuthDeps): Promise<Response> {
         "invalid_request", "The token request must be application/x-www-form-urlencoded.");
   }
 
+  // Checked first, and answered with RFC 6749 §5.2's own `unsupported_grant_type` at 400 rather
+  // than a generic `invalid_request`. A client may legitimately have *registered* asking for
+  // `refresh_token` (registration narrows rather than refuses), so this is the point at which it
+  // finds out -- it must get the spec's name for the condition, not a puzzle.
   let grantType = form.get("grant_type");
   if (grantType !== "authorization_code") {
     throw new OAuthProtocolError(
         "unsupported_grant_type",
-        "Only the authorization_code grant is supported; this server issues no refresh tokens.");
+        `Only the authorization_code grant is supported. This server issues no refresh tokens: ` +
+        `the access token it returns is a long-lived credential, revocable from Settings.`);
   }
 
   let code = form.get("code");
