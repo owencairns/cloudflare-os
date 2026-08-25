@@ -9,7 +9,7 @@ import type {
   VendorDescription, AccountDescription, AgentCatalog,
   AppUiContext, GatekeeperUser, GatekeeperUiFrame, ApprovalQueue, ObservationAuthorizer,
   GatekeeperConnectCallback, GatekeeperConnectOptions, SupportedResource,
-  Gatekeeper, GatekeeperUserVerifier, ResourceDescription, ActionKind,
+  Gatekeeper, GatekeeperUserVerifier, ResourceDescription, ActionKind, ActionDescription,
   SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { LibraryReadSession } from "./library-read.js";
@@ -20,7 +20,12 @@ import {
   buildAgentSkillCommands, buildAgentSkillMessage, buildContextCatalog, parseSkillManifest,
   type CollectionSkills,
 } from "./agent-skill.js";
-import type { EnabledCollectionInfo } from "./context-types.js";
+import {
+  contentTypeFromPath, MAX_DOCUMENT_BODY_BYTES,
+  type ContextDocument, type EnabledCollectionInfo,
+} from "./context-types.js";
+import { validateDocumentPath } from "./context-collection.js";
+import { encodeStoredContextBody } from "./context-storage.js";
 import { domainName, DEFAULT_SHARING_DOMAIN } from "./domain.js";
 import APP_HTML from "./generated/app.txt";
 
@@ -79,6 +84,17 @@ interface ContextLibrary {
   list(opts?: { collectionId?: string; path?: string }): Promise<ContextListing>;
   /** Read a document by an ID from the catalog, search(), or list(). */
   read(docId: string): Promise<ContextDocument | null>;
+  /** Create or replace a document in one of your private, web-backed collections. The action is
+   *  submitted through the normal approval queue before storage changes. */
+  write(collectionId: string, path: string, doc: {
+    description: string;
+    body: string;
+    contentType?: string;
+  }): Promise<void>;
+  /** Remove one document from one of your private, web-backed collections after approval. */
+  remove(collectionId: string, path: string): Promise<void>;
+  /** Move one document to a new path in one of your private, web-backed collections after approval. */
+  move(collectionId: string, fromPath: string, toPath: string): Promise<void>;
 }
 
 interface ContextSearchResult {
@@ -112,6 +128,40 @@ interface ContextDocument {
   content: string;        // text (markdown/etc.) or a data: URI for binary content
 }
 `;
+
+const CONTEXT_WRITE_ACTION_KIND: ActionKind = {
+  tag: "context.write",
+  label: "Write Context documents",
+};
+
+type ContextActionPayload = {
+  kind: "write";
+  collectionId: string;
+  path: string;
+  document: { description: string; body: string; contentType: string };
+  previous: ContextDocument | null;
+} | {
+  kind: "remove";
+  collectionId: string;
+  path: string;
+  previous: ContextDocument;
+} | {
+  kind: "move";
+  collectionId: string;
+  fromPath: string;
+  toPath: string;
+};
+
+type StoredContextAction = ContextActionPayload & {
+  id: number;
+  status: "pending" | "applied";
+};
+
+function contentPreview(body: string): string {
+  const limit = 8_000;
+  let preview = body.slice(0, limit);
+  return preview + (body.length > limit ? `\n\n… ${body.length - limit} more character(s)` : "");
+}
 
 // Persisted account props. No user identity; private data keys by accountId within the domain.
 type ContextAccountProps = {
@@ -214,7 +264,8 @@ export class ContextVerifier
   }
 }
 
-// Gadget-side read path. Read-only: no actions are ever submitted.
+// Gadget-side Context path. Reads are observation-audited; mutations are staged through the
+// approval queue and restricted to private web collections owned by this account.
 @validateRpc()
 export class ContextGatekeeper
     extends DurableObject<Cloudflare.Env, ContextAccountProps>
@@ -223,6 +274,110 @@ export class ContextGatekeeper
   #userLibraries() { return this.ctx.exports.UserLibraryDurableObject; }
   #observers() {
     return new ContextObserverTracker(this.ctx.storage.kv, this.ctx.props.sharingDomain);
+  }
+
+  #actionKey(id: number): string { return `action:${id}`; }
+
+  #nextActionId(): number {
+    let id = (this.ctx.storage.kv.get<number>("actionCounter") ?? 0) + 1;
+    this.ctx.storage.kv.put("actionCounter", id);
+    return id;
+  }
+
+  async #ownedWebCollection(collectionId: string) {
+    let domain = this.ctx.props.sharingDomain;
+    let userLibrary = this.#userLibraries().get(
+      this.#userLibraries().idFromName(domainName(domain, this.ctx.props.accountId)));
+    if (!(await userLibrary.hasOwned(collectionId))) {
+      throw new Error(
+        "Agents may only write private Context collections owned by this account.");
+    }
+    let collection = this.#collections().get(
+      this.#collections().idFromName(domainName(domain, collectionId)));
+    let metadata = await collection.getMetadata();
+    if (metadata.content.source !== "web") {
+      throw new Error("Git-backed Context collections must be changed through git.");
+    }
+    return { collection, metadata };
+  }
+
+  async #enqueue(
+      queue: NativeRpcStub<ApprovalQueue>, payload: ContextActionPayload,
+      description: ActionDescription): Promise<void> {
+    let id = this.#nextActionId();
+    this.ctx.storage.kv.put<StoredContextAction>(
+      this.#actionKey(id), { ...payload, id, status: "pending" });
+    try {
+      await queue.submitAction(id, description);
+    } catch (error) {
+      this.ctx.storage.kv.delete(this.#actionKey(id));
+      throw error;
+    }
+  }
+
+  async #stageWrite(
+      queue: NativeRpcStub<ApprovalQueue>, collectionId: string, path: string,
+      doc: { description: string; body: string; contentType?: string }): Promise<void> {
+    validateDocumentPath(path);
+    let contentType = doc.contentType || contentTypeFromPath(path);
+    let encodedBody = encodeStoredContextBody(contentType, doc.body);
+    if (encodedBody.byteLength > MAX_DOCUMENT_BODY_BYTES) {
+      throw new Error(
+        `Document is too large (${encodedBody.byteLength} bytes; max ${MAX_DOCUMENT_BODY_BYTES}).`);
+    }
+    let { collection, metadata } = await this.#ownedWebCollection(collectionId);
+    let previous = await collection.getContextDocument(path);
+    await this.#enqueue(queue, {
+      kind: "write",
+      collectionId,
+      path,
+      document: { description: doc.description, body: doc.body, contentType },
+      previous,
+    }, {
+      title: `${previous ? "Update" : "Create"} Context document: ${path}`,
+      description:
+        `${previous ? "Replace" : "Create"} \`${path}\` in **${metadata.title}**.\n\n` +
+        `**When to use this:** ${doc.description || "Not specified"}\n\n` +
+        `\`\`\`${contentType}\n${contentPreview(doc.body)}\n\`\`\``,
+      implementsRevert: true,
+      awaitDecision: true,
+      autoApprovable: true,
+      actionKind: CONTEXT_WRITE_ACTION_KIND,
+    });
+  }
+
+  async #stageRemove(
+      queue: NativeRpcStub<ApprovalQueue>, collectionId: string, path: string): Promise<void> {
+    validateDocumentPath(path);
+    let { collection, metadata } = await this.#ownedWebCollection(collectionId);
+    let previous = await collection.getContextDocument(path);
+    if (!previous) throw new Error(`Document not found: ${path}`);
+    await this.#enqueue(queue, { kind: "remove", collectionId, path, previous }, {
+      title: `Remove Context document: ${path}`,
+      description: `Remove \`${path}\` from **${metadata.title}**.`,
+      implementsRevert: true,
+      awaitDecision: true,
+    });
+  }
+
+  async #stageMove(
+      queue: NativeRpcStub<ApprovalQueue>, collectionId: string, fromPath: string,
+      toPath: string): Promise<void> {
+    validateDocumentPath(fromPath);
+    validateDocumentPath(toPath);
+    let { collection, metadata } = await this.#ownedWebCollection(collectionId);
+    if (!(await collection.getContextDocument(fromPath))) {
+      throw new Error(`Document not found: ${fromPath}`);
+    }
+    if (await collection.getContextDocument(toPath)) {
+      throw new Error(`Destination already exists: ${toPath}`);
+    }
+    await this.#enqueue(queue, { kind: "move", collectionId, fromPath, toPath }, {
+      title: `Move Context document: ${fromPath}`,
+      description: `Move \`${fromPath}\` to \`${toPath}\` in **${metadata.title}**.`,
+      implementsRevert: true,
+      awaitDecision: true,
+    });
   }
 
   async #loadSkills(
@@ -282,7 +437,24 @@ export class ContextGatekeeper
   }
 
   async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<LibraryReadSession> {
-    return this.#newReadSession(approvalQueue);
+    let queue = approvalQueue.dup();
+    try {
+      return new LibraryReadSession(
+        this.#collections(), this.#userLibraries(),
+        this.ctx.props.sharingDomain, this.ctx.props.accountId, queue,
+        collectionIds => this.#observers().prepareObservation(collectionIds),
+        {
+          write: (collectionId, path, doc) =>
+            this.#stageWrite(queue, collectionId, path, doc),
+          remove: (collectionId, path) => this.#stageRemove(queue, collectionId, path),
+          move: (collectionId, fromPath, toPath) =>
+            this.#stageMove(queue, collectionId, fromPath, toPath),
+        },
+      );
+    } catch (error) {
+      queue[Symbol.dispose]?.();
+      throw error;
+    }
   }
 
   async getSlashCommandProvider():
@@ -338,9 +510,8 @@ export class ContextGatekeeper
     return catalog;
   }
 
-  /** Read-only gatekeeper: no side-effecting actions, so nothing is ever auto-approvable. */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [];
+    return [CONTEXT_WRITE_ACTION_KIND];
   }
 
   /**
@@ -356,16 +527,52 @@ export class ContextGatekeeper
     this.#observers().removeObserver(id);
   }
 
-  /** Read-only gatekeeper: no actions are submitted, so these callbacks should never run. */
-  applyAction(_action: number): Promise<void> {
-    throw new Error("The Context Library is read-only and implements no actions.");
+  async applyAction(actionId: number): Promise<void> {
+    let action = this.ctx.storage.kv.get<StoredContextAction>(this.#actionKey(actionId));
+    if (!action) throw new Error(`Unknown Context action: ${actionId}`);
+    if (action.status !== "pending") throw new Error(`Context action ${actionId} is not pending.`);
+    let { collection } = await this.#ownedWebCollection(action.collectionId);
+    switch (action.kind) {
+      case "write":
+        await collection.putContextDocument(action.path, action.document);
+        break;
+      case "remove":
+        await collection.deleteContextDocument(action.path);
+        break;
+      case "move":
+        await collection.moveContextDocument(action.fromPath, action.toPath);
+        break;
+    }
+    action.status = "applied";
+    this.ctx.storage.kv.put(this.#actionKey(actionId), action);
   }
-  rejectAction(_action: number): Promise<void | { restart?: boolean }> {
-    throw new Error("The Context Library is read-only and implements no actions.");
+
+  async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
+    this.ctx.storage.kv.delete(this.#actionKey(actionId));
   }
-  revertAction(_action: number):
+
+  async revertAction(actionId: number):
       Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-    throw new Error("The Context Library is read-only and implements no actions.");
+    let action = this.ctx.storage.kv.get<StoredContextAction>(this.#actionKey(actionId));
+    if (!action) throw new Error(`Unknown Context action: ${actionId}`);
+    if (action.status !== "applied") throw new Error(`Context action ${actionId} is not applied.`);
+    let { collection } = await this.#ownedWebCollection(action.collectionId);
+    switch (action.kind) {
+      case "write":
+        if (action.previous) {
+          await collection.putContextDocument(action.path, action.previous);
+        } else if (await collection.getContextDocument(action.path)) {
+          await collection.deleteContextDocument(action.path);
+        }
+        break;
+      case "remove":
+        await collection.putContextDocument(action.path, action.previous);
+        break;
+      case "move":
+        await collection.moveContextDocument(action.toPath, action.fromPath);
+        break;
+    }
+    this.ctx.storage.kv.delete(this.#actionKey(actionId));
   }
 }
 

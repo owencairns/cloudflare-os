@@ -6,8 +6,9 @@ import { validateRpc } from "capnweb-validate";
 import {
   ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
   ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
-  DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
+  ContextLibraryBackup, ContextLibraryImportResult, DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
 } from "./context-types.js";
+import { normalizeContextLibraryBackup } from "./context-backup.js";
 import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import type { LibraryRegistryDurableObject } from "./registry-do.js";
@@ -153,6 +154,12 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
         : { source },
     };
 
+    return this.#createContextCollection(metadata);
+  }
+
+  async #createContextCollection(
+      metadata: ContextCollectionMetadata): Promise<ContextCollectionMetadata> {
+    let { id, title, description, icon, visibility } = metadata;
     // Initialize before indexing; if this fails, nothing is reachable yet.
     metadata = await this.#collection(id).initialize(metadata, this.domain, visibility === "private" ? this.accountId : "");
 
@@ -267,5 +274,123 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
       this.#registry().isPublic(collectionId),
     ]);
     return owns || (isPublic && this.isAdmin);
+  }
+
+  // --- Backup & restore ---
+
+  async exportContextLibrary(): Promise<ContextLibraryBackup> {
+    let enabled = await this.listEnabledContextCollections();
+    let collections = await Promise.all(enabled.map(async entry => {
+      await this.#assertCanRead(entry.id);
+      let stub = this.#collection(entry.id);
+      let [metadata, summaries] = await Promise.all([
+        stub.getMetadata(),
+        stub.listContextDocuments(),
+      ]);
+      let documents = await Promise.all(summaries.map(async summary => {
+        let document = await stub.getContextDocument(summary.path);
+        if (!document) throw new Error(`Document disappeared during export: ${summary.path}`);
+        return {
+          path: document.path,
+          description: document.description,
+          contentType: document.contentType,
+          body: document.body,
+          lastUpdated: document.lastUpdated.toISOString(),
+        };
+      }));
+      return {
+        metadata: {
+          id: metadata.id,
+          ...(metadata.icon === undefined ? {} : { icon: metadata.icon }),
+          title: metadata.title,
+          description: metadata.description,
+          visibility: metadata.visibility,
+          created: metadata.created.toISOString(),
+          lastUpdated: metadata.lastUpdated.toISOString(),
+          source: metadata.content.source,
+        },
+        documents,
+      };
+    }));
+    return {
+      format: "context-library",
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      collections,
+    };
+  }
+
+  async importContextLibrary(
+      input: ContextLibraryBackup,
+      options: { mode?: "merge" | "replace" } = {}): Promise<ContextLibraryImportResult> {
+    let snapshot = normalizeContextLibraryBackup(input);
+    let mode = options.mode ?? "merge";
+    if (mode !== "merge" && mode !== "replace") {
+      throw new Error("Context import mode must be merge or replace.");
+    }
+    if (!this.isAdmin && snapshot.collections.some(
+      collection => collection.metadata.visibility === "public")) {
+      throw new Error("Admin access is required to restore public collections.");
+    }
+
+    if (mode === "replace") {
+      let enabled = await this.listEnabledContextCollections();
+      for (let entry of enabled) {
+        if (await this.canWriteContextCollection(entry.id)) {
+          await this.#collection(entry.id).deleteSelf();
+        }
+      }
+    }
+
+    let documentCount = 0;
+    for (let backup of snapshot.collections) {
+      let { metadata: stored, documents } = backup;
+      let current = await this.getContextCollectionMetadata(stored.id);
+      let metadata: ContextCollectionMetadata = {
+        id: stored.id,
+        ...(stored.icon === undefined ? {} : { icon: stored.icon }),
+        title: stored.title,
+        description: stored.description,
+        visibility: stored.visibility,
+        created: new Date(stored.created),
+        lastUpdated: new Date(stored.lastUpdated),
+        documentCount: documents.length,
+        // Restores are self-contained and writable even when the source snapshot mirrored git.
+        content: { source: "web" },
+      };
+      let normalizedDocuments: ContextDocument[] = documents.map(document => ({
+        path: document.path,
+        name: document.path.slice(document.path.lastIndexOf("/") + 1),
+        description: document.description,
+        contentType: document.contentType,
+        body: document.body,
+        lastUpdated: new Date(document.lastUpdated),
+      }));
+
+      if (!current) {
+        await this.#createContextCollection(metadata);
+        await this.#collection(stored.id).replaceContextDocuments(normalizedDocuments);
+      } else {
+        await this.#assertCanWrite(stored.id);
+        if (current.visibility !== stored.visibility) {
+          throw new Error(`Cannot merge collection ${stored.id} with a different visibility.`);
+        }
+        await this.#collection(stored.id).updateMetadata({
+          title: stored.title,
+          description: stored.description,
+          ...(stored.icon === undefined ? {} : { icon: stored.icon }),
+        });
+        if (mode === "replace") {
+          await this.#collection(stored.id).replaceContextDocuments(normalizedDocuments);
+        } else {
+          for (let document of normalizedDocuments) {
+            await this.#collection(stored.id).putContextDocument(document.path, document);
+          }
+        }
+      }
+      documentCount += documents.length;
+    }
+
+    return { mode, collections: snapshot.collections.length, documents: documentCount };
   }
 }

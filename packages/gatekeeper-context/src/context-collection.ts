@@ -39,8 +39,8 @@ const GIT_BRANCH_RE = /^(?!\/)(?!.*\/$)[A-Za-z0-9/._-]{1,255}$/;
 // change.
 const SKILL_INDEX_VERSION = 1;
 
-// Validate a document path before using it as a storage key.
-function validateDocumentPath(path: string): void {
+/** Validate a document path before using it as a storage key. */
+export function validateDocumentPath(path: string): void {
   if (typeof path !== "string" || path.length === 0) {
     throw new Error("Document path is required.");
   }
@@ -470,6 +470,48 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
 
       let meta = this.getMetadata();
       meta.lastUpdated = new Date();
+      this.storage.metadata.put(meta);
+    });
+    await this.#propagate();
+  }
+
+  /** Replace a web collection's documents from a validated logical backup, preserving timestamps. */
+  async replaceContextDocuments(documents: ContextDocument[]): Promise<void> {
+    this.#assertWebWritable();
+    let records = documents.map(document => {
+      validateDocumentPath(document.path);
+      let contentType = document.contentType || contentTypeFromPath(document.path);
+      let record = contextRecord({
+        ...document,
+        name: baseName(document.path),
+        contentType,
+        lastUpdated: new Date(document.lastUpdated),
+      });
+      let byteLength = record.body.byteLength + new TextEncoder().encode(
+        JSON.stringify({ ...record, body: "" }),
+      ).byteLength;
+      if (byteLength > MAX_DOCUMENT_BODY_BYTES) {
+        throw new Error(
+          `Document is too large (${byteLength} bytes; max ${MAX_DOCUMENT_BODY_BYTES}).`);
+      }
+      return record;
+    });
+    if (new Set(records.map(record => record.path)).size !== records.length) {
+      throw new Error("Backup contains duplicate document paths.");
+    }
+
+    this.storage.transaction(() => {
+      for (let record of Array.from(this.storage.documents.list())) {
+        this.#deleteDocument(record.path);
+      }
+      for (let record of records) this.#putDocument(record);
+
+      let meta = this.getMetadata();
+      meta.documentCount = records.length;
+      meta.lastUpdated = records.reduce(
+        (latest, record) => record.lastUpdated > latest ? record.lastUpdated : latest,
+        meta.lastUpdated,
+      );
       this.storage.metadata.put(meta);
     });
     await this.#propagate();

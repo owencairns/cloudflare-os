@@ -183,6 +183,42 @@ export type ContextDocumentSummary = {
   lastUpdated: Date;
 };
 
+/** Portable, logical backup of one Context collection. Git-backed collections restore as web
+ * collections so the snapshot is self-contained instead of depending on an external repository. */
+export type ContextCollectionBackup = {
+  metadata: {
+    id: string;
+    icon?: string;
+    title: string;
+    description: string;
+    visibility: ContextCollectionVisibility;
+    created: string;
+    lastUpdated: string;
+    source: ContextCollectionContent["source"];
+  };
+  documents: Array<{
+    path: string;
+    description: string;
+    contentType: string;
+    body: string;
+    lastUpdated: string;
+  }>;
+};
+
+/** Complete backup of the collections visible through one Context account. */
+export type ContextLibraryBackup = {
+  format: "context-library";
+  schemaVersion: 1;
+  exportedAt: string;
+  collections: ContextCollectionBackup[];
+};
+
+export type ContextLibraryImportResult = {
+  mode: "merge" | "replace";
+  collections: number;
+  documents: number;
+};
+
 /** A user's record of one of their own (private) collections. */
 export type OwnedCollectionRecord = {
   id: string;
@@ -337,4 +373,11 @@ export interface ContextApi extends RpcTarget {
   listEnabledContextCollections(): Promise<EnabledCollectionInfo[]>;
   /** Whether the viewer may edit this collection: own private collection, or public collection as admin. */
   canWriteContextCollection(collectionId: string): Promise<boolean>;
+  /** Export every collection visible to this account as a self-contained JSON-safe snapshot. */
+  exportContextLibrary(): Promise<ContextLibraryBackup>;
+  /** Restore a snapshot. Merge preserves unrelated collections; replace removes writable ones first. */
+  importContextLibrary(
+    snapshot: ContextLibraryBackup,
+    options?: { mode?: "merge" | "replace" },
+  ): Promise<ContextLibraryImportResult>;
 }

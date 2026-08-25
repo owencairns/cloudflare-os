@@ -21,6 +21,7 @@ import {
   Key,
   Image as ImageIcon,
   UploadSimple,
+  DownloadSimple,
   FilePlus,
   FolderPlus,
   User,
@@ -928,6 +929,7 @@ function CreateCollectionView({
 
 export default function ContextLibraryPage() {
   const context = useContextApi();
+  const toasts = useKumoToastManager();
 
   // Iframe-local selection state (no router/URL).
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null);
@@ -943,6 +945,9 @@ export default function ContextLibraryPage() {
 
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   const [enabled, setEnabled] = useState<EnabledCollectionInfo[]>([]);
   const [enabledLoaded, setEnabledLoaded] = useState(false);
@@ -960,6 +965,47 @@ export default function ContextLibraryPage() {
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  const handleExport = useCallback(async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const snapshot = await context.exportContextLibrary();
+      const blob = new Blob([JSON.stringify(snapshot, null, 2) + "\n"], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `context-library-${new Date().toISOString().slice(0, 10)}.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      toasts.add({ title: "Context backup exported", variant: "success" });
+    } catch {
+      toasts.add({ title: "Failed to export Context backup", variant: "error" });
+    } finally {
+      setExporting(false);
+    }
+  }, [context, exporting, toasts]);
+
+  const handleImport = useCallback(async (file: File) => {
+    if (importing) return;
+    setImporting(true);
+    try {
+      const snapshot = JSON.parse(await file.text());
+      const result = await context.importContextLibrary(snapshot, { mode: "merge" });
+      await loadAll();
+      toasts.add({
+        title: `Imported ${pluralize(result.documents, "document")}`,
+        variant: "success",
+      });
+    } catch {
+      toasts.add({ title: "Failed to import Context backup", variant: "error" });
+    } finally {
+      setImporting(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }, [context, importing, loadAll, toasts]);
 
   const searchLower = search.toLowerCase();
   // One combined list: public (org) collections first, then your own, each alphabetical.
@@ -1022,16 +1068,46 @@ export default function ContextLibraryPage() {
             Collections of documents, skills, and other files your agents can use.
           </p>
         </div>
-        {enabled.length > 0 && (
+        <div className="flex shrink-0 items-center gap-2">
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void handleImport(file);
+            }}
+          />
           <button
             type="button"
-            onClick={() => setCreating(true)}
-            className="press inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover"
+            onClick={() => importInputRef.current?.click()}
+            disabled={importing}
+            className="press inline-flex h-9 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-3 text-[13px] font-medium tracking-[-0.25px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-wait disabled:opacity-50"
           >
-            <Plus size={14} weight="bold" />
-            New collection
+            <UploadSimple size={14} />
+            {importing ? "Importing…" : "Import"}
           </button>
-        )}
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={exporting || enabled.length === 0}
+            className="press inline-flex h-9 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-3 text-[13px] font-medium tracking-[-0.25px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <DownloadSimple size={14} />
+            {exporting ? "Exporting…" : "Export"}
+          </button>
+          {enabled.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setCreating(true)}
+              className="press inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover"
+            >
+              <Plus size={14} weight="bold" />
+              New collection
+            </button>
+          )}
+        </div>
       </header>
 
       {enabled.length > 0 && (

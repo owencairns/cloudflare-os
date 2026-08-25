@@ -23,6 +23,16 @@ const logger = obsContext.createLogger({
 // Fanout cap for whole-library search/list.
 const MAX_COLLECTION_FANOUT = 8;
 
+export type ContextLibraryMutations = {
+  write(collectionId: string, path: string, doc: {
+    description: string;
+    body: string;
+    contentType?: string;
+  }): Promise<void>;
+  remove(collectionId: string, path: string): Promise<void>;
+  move(collectionId: string, fromPath: string, toPath: string): Promise<void>;
+};
+
 type ObserveCollections = (collectionIds: string[]) => Promise<{
   excludeObservers?: string[];
   pendingCollections: string[];
@@ -42,8 +52,31 @@ export class LibraryReadSession extends RpcTarget {
     private accountId: string,
     private authorizer: NativeRpcStub<ObservationAuthorizer>,
     private observeCollections: ObserveCollections,
+    private mutations?: ContextLibraryMutations,
   ) {
     super();
+  }
+
+  /** Stage a create or update in an owned private, web-backed collection. */
+  write(collectionId: string, path: string, doc: {
+    description: string;
+    body: string;
+    contentType?: string;
+  }): Promise<void> {
+    if (!this.mutations) throw new Error("This Context session is read-only.");
+    return this.mutations.write(collectionId, path, doc);
+  }
+
+  /** Stage deletion of one document in an owned private, web-backed collection. */
+  remove(collectionId: string, path: string): Promise<void> {
+    if (!this.mutations) throw new Error("This Context session is read-only.");
+    return this.mutations.remove(collectionId, path);
+  }
+
+  /** Stage a path change for one document in an owned private, web-backed collection. */
+  move(collectionId: string, fromPath: string, toPath: string): Promise<void> {
+    if (!this.mutations) throw new Error("This Context session is read-only.");
+    return this.mutations.move(collectionId, fromPath, toPath);
   }
 
   /** Release the authorizer owned by this read session. */

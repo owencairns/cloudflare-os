@@ -67,8 +67,8 @@ const GADGETS: GadgetSpec[] = [
   },
 ];
 
-/** Gadget 0 is the one and only permanent gadget in each of these workspaces. */
-const GADGET_INDEX = 0;
+/** The established first-party workspaces predate multi-gadget support and use gadget 0. */
+const LEGACY_GADGET_INDEX = 0;
 const SCHEMA_VERSION = 1;
 
 // ---------------------------------------------------------------------------------------------
@@ -133,10 +133,11 @@ async function withGadget<T>(
   auth: RpcStub<AuthenticatedApi>,
   workspaceId: string,
   fn: (gadget: RpcStub<Record<string, (...args: never[]) => Promise<unknown>>>) => Promise<T>,
+  gadgetId: number = LEGACY_GADGET_INDEX,
 ): Promise<T> {
   const overseer = await auth.openGadget(workspaceId);
   try {
-    const workpiece = await overseer.getGadget(GADGET_INDEX);
+    const workpiece = await overseer.getGadget(gadgetId);
     try {
       const gadget = await workpiece.connectToGadget();
       try {
@@ -162,11 +163,13 @@ async function importGadget(
   workspaceId: string,
   snapshot: Snapshot,
   mode: "replace" | "merge",
+  gadgetId: number = LEGACY_GADGET_INDEX,
 ): Promise<{ imported: number; skipped: number }> {
   const result = await withGadget(
     auth,
     workspaceId,
     (gadget) => gadget.importAll(snapshot as never, { mode } as never) as Promise<unknown>,
+    gadgetId,
   );
   return result as { imported: number; skipped: number };
 }
@@ -235,13 +238,18 @@ async function verifyRoundTrip(
   const scratch = await auth.newGadgetFromBlueprint(spec.blueprintId, {});
   let scratchId: string | undefined;
   try {
-    const metadata = (await scratch.getMetadata()) as { id?: string };
+    const metadata = (await scratch.getMetadata()) as { id?: string; defaultGadgetId?: number };
     scratchId = metadata.id;
     await scratch.setTitle(`[scratch] ${spec.name} restore verification`);
     if (!scratchId) throw new Error("scratch workspace has no id");
+    if (metadata.defaultGadgetId === undefined) {
+      throw new Error("scratch workspace has no default gadget id");
+    }
 
-    const result = await importGadget(auth, scratchId, snapshot, "replace");
-    const restored = await exportByWorkspace(auth, scratchId, spec.name);
+    const result = await importGadget(
+      auth, scratchId, snapshot, "replace", metadata.defaultGadgetId);
+    const restored = await exportByWorkspace(
+      auth, scratchId, spec.name, metadata.defaultGadgetId);
     const before = JSON.stringify(snapshot.data);
     const after = JSON.stringify(restored.data);
     if (before !== after) {
@@ -271,8 +279,10 @@ async function exportByWorkspace(
   auth: RpcStub<AuthenticatedApi>,
   workspaceId: string,
   expectedGadget: string,
+  gadgetId: number,
 ): Promise<Snapshot> {
-  const raw = await withGadget(auth, workspaceId, (gadget) => gadget.exportAll() as Promise<unknown>);
+  const raw = await withGadget(
+    auth, workspaceId, (gadget) => gadget.exportAll() as Promise<unknown>, gadgetId);
   return validateSnapshot(raw, expectedGadget);
 }
 
