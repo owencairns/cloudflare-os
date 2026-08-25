@@ -45,3 +45,6 @@ wrangler.dev.jsonc
 **/.dev.vars
 **/.dev.vars.*
 .os-client.env
+
+# Local gadget snapshots written by `pnpm os-backup` -- company data, never committed.
+backups/

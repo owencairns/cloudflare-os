@@ -21,7 +21,8 @@
     "types:scripts": "tsc -p scripts/tsconfig.json",
     "lint": "pnpm run lint:check && pnpm run types:scripts && pnpm run types:check",
     "types:generate": "node scripts/generate-worker-types.ts",
-    "os-client": "node scripts/os-client/index.ts"
+    "os-client": "node scripts/os-client/index.ts",
+    "os-backup": "node scripts/os-backup/backup.ts"
   },
   "dependencies": {
     "@gadgets/workshop-shared": "workspace:*",
