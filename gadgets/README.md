@@ -1,7 +1,8 @@
 # First-party gadgets (source of record)
 
-This directory vendors the source of the three first-party gadgets running on the
-live **MyoPlan OS** instance at `https://os.myoplan.app`: **Tasks**, **Memory**, **Docs**.
+This directory vendors the source of the first-party **Tasks** gadget running on the
+live **MyoPlan OS** instance at `https://os.myoplan.app`. Durable company knowledge
+lives in the platform's ambient **Context** gatekeeper, not in a gadget.
 
 Each gadget is its own permanent workspace on that instance (not a workpiece inside
 some other user's workspace). Before this directory existed, their code lived only
@@ -17,8 +18,6 @@ users actually talk to — but it should always match what's committed here.
 | Gadget | Workspace id | Gadget id (workpiece index) | Blueprint |
 |---|---|---|---|
 | Tasks | `8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564` | `0` | see `blueprint:publish` output / `outputs:list` |
-| Memory | `411258bdc55cf8950adcfb772970aa58c7b62def8c088cc5cfd750d442e0c546` | `0` | see `blueprint:publish` output / `outputs:list` |
-| Docs | `99af739b4c5e5d823f61743dc61b8045622016abe0f2fad3c11aa2833c896ce8` | `0` | see `blueprint:publish` output / `outputs:list` |
 
 These ids are stable identifiers for the live workspaces; keep this table in sync if
 any gadget is ever recreated under a new workspace.
@@ -45,7 +44,7 @@ runtime:
   - Theming: the sandboxed iframe has no access to the host page's CSS. Gadgets pick
     up the live theme via a `postMessage` handshake with the parent frame (a
     `myoplan-theme` message carrying the current theme tokens), and apply it with the
-    three-block CSS pattern used across all three gadgets: a `:root` block with light
+    three-block CSS pattern: a `:root` block with light
     (default) values, a `@media (prefers-color-scheme: dark)` block, and a
     `[data-theme="dark"]` override block, so the gadget matches the host regardless of
     how the theme was chosen.
@@ -78,9 +77,8 @@ pnpm os-gadget check
 ### Gotcha: chat ids are not reliably `0`
 
 `code:write` and `code:merge` both take a `chatId`, and it is tempting to assume the
-gadget's original chat (often `0`) still exists. It doesn't always — Memory's chat
-`0` was deleted at some point, so `0` now 404s for that workspace. Don't hardcode
-`chatId`. Instead:
+gadget's original chat (often `0`) still exists. Chats can be deleted, so don't
+hardcode `chatId`. Instead:
 
 - `pnpm os-client ws:show <wsId>` lists the workspace's current chats — pick a live one, or
 - `pnpm os-client chat:new <wsId> "<message>"` to start a fresh chat and use the
@@ -91,11 +89,11 @@ gadget's original chat (often `0`) still exists. It doesn't always — Memory's 
 `scripts/os-gadget-sync.ts` (wired up as `pnpm os-gadget`) automates the read side
 of the above:
 
-- `pnpm os-gadget pull` — fetch current prod source for all three gadgets into
+- `pnpm os-gadget pull` — fetch current prod source for the Tasks gadget into
   `gadgets/<name>/`, and print a diff summary against what was already on disk (or
   `pnpm os-gadget pull --gadget tasks` for just one).
-- `pnpm os-gadget check` — fetch prod and assert it matches the repo byte-for-byte
-  for all three gadgets; exits non-zero (and prints a diff) on any drift. This is
+- `pnpm os-gadget check` — fetch prod and assert it matches the repo byte-for-byte;
+  exits non-zero (and prints a diff) on any drift. This is
   the guard against "someone edited prod directly (or merged a chat without
   updating this repo) and now the repo is stale."
 

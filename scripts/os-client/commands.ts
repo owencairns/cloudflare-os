@@ -88,6 +88,23 @@ export async function wsShow(wsId: string): Promise<unknown> {
   }
 }
 
+/** Permanently delete one workspace after the CLI has required an exact-id confirmation. */
+export async function wsDelete(wsId: string): Promise<unknown> {
+  const { pub, auth } = await connectAuthenticated();
+  try {
+    const overseer = await auth.openGadget(wsId);
+    try {
+      const metadata = await overseer.getMetadata();
+      await overseer.deleteSelf();
+      return { deleted: true, workspaceId: wsId, title: metadata.title };
+    } finally {
+      disposeQuietly(overseer);
+    }
+  } finally {
+    disposeQuietly(pub);
+  }
+}
+
 /** Collects the workpiece roster via the only enumeration path: subscribe, gather entry()
  *  deliveries until ready(), then dispose. */
 async function listWorkpieces(overseer: RpcStub<Overseer>): Promise<WorkpieceSummary[]> {
@@ -136,6 +153,22 @@ export async function gadgetCreate(wsId: string, title: string): Promise<unknown
       } finally {
         disposeQuietly(gadget);
       }
+    } finally {
+      disposeQuietly(overseer);
+    }
+  } finally {
+    disposeQuietly(pub);
+  }
+}
+
+/** Remove a workspace-owned blueprint before retiring its source workspace. */
+export async function blueprintDelete(wsId: string, blueprintId: string): Promise<unknown> {
+  const { pub, auth } = await connectAuthenticated();
+  try {
+    const overseer = await auth.openGadget(wsId);
+    try {
+      await overseer.deleteBlueprint(blueprintId);
+      return { deleted: true, workspaceId: wsId, blueprintId };
     } finally {
       disposeQuietly(overseer);
     }

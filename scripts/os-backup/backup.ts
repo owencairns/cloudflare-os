@@ -1,14 +1,14 @@
 #!/usr/bin/env node
-// Backup / restore for the three first-party MyoPlan OS gadgets (tasks, memory, docs).
+// Backup / restore for the first-party MyoPlan OS Tasks gadget.
 //
 // Every gadget keeps its company data in its own Durable Object's SQLite storage, which has no
 // export, no snapshot, and no recovery path of its own. Each gadget's server.js exposes
 // `exportAll()` / `importAll(snapshot, {mode})`; this script is the operator-facing half: it pulls
-// a complete snapshot of all three to local JSON, and can push one back.
+// a complete snapshot to local JSON, and can push one back.
 //
 // Usage (from the repo root):
-//   pnpm os-backup                                  back up all gadgets -> backups/<ISO-date>/
-//   pnpm os-backup --gadget docs                    back up just one
+//   pnpm os-backup                                  back up Tasks -> backups/<ISO-date>/
+//   pnpm os-backup --gadget tasks                   back up Tasks explicitly
 //   pnpm os-backup --out /some/where                write somewhere else
 //   pnpm os-backup --verify                         backup, then prove the snapshot restores by
 //                                                   round-tripping it through a scratch workspace
@@ -54,16 +54,6 @@ const GADGETS: GadgetSpec[] = [
     name: "tasks",
     workspaceId: "8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564",
     blueprintId: "71826818ade38c9bfe78705e53ea334c",
-  },
-  {
-    name: "memory",
-    workspaceId: "411258bdc55cf8950adcfb772970aa58c7b62def8c088cc5cfd750d442e0c546",
-    blueprintId: "ca6c25cba02cd5109c25c9def5047134",
-  },
-  {
-    name: "docs",
-    workspaceId: "99af739b4c5e5d823f61743dc61b8045622016abe0f2fad3c11aa2833c896ce8",
-    blueprintId: "3e8e0a55148fdd7ae0448a75fdab52c5",
   },
 ];
 

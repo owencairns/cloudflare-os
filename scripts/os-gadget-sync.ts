@@ -21,11 +21,9 @@ loadDotEnv();
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const GADGETS_DIR = join(ROOT, "gadgets");
 
-// wsId of each gadget's workspace; gadget index within it is always 0 for these three.
+// The Tasks workspace predates multi-gadget support, so its gadget index is 0.
 const GADGETS: { name: string; wsId: string }[] = [
   { name: "tasks", wsId: "8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564" },
-  { name: "memory", wsId: "411258bdc55cf8950adcfb772970aa58c7b62def8c088cc5cfd750d442e0c546" },
-  { name: "docs", wsId: "99af739b4c5e5d823f61743dc61b8045622016abe0f2fad3c11aa2833c896ce8" },
 ];
 
 interface RemoteFiles {

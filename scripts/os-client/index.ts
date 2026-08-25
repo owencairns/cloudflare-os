@@ -23,6 +23,7 @@ Commands:
   ws:list                                            list workspaces
   ws:create <title>                                  create a workspace
   ws:show <id>                                       workspace metadata + workpieces + chats
+  ws:delete <id> --confirm <id>                      permanently delete a workspace
   gadget:create <wsId> <title>                       create a permanent gadget in a workspace
   code:read <wsId> <gadgetId>                        read a gadget's committed files
   code:write <wsId> <gadgetId> <chatId> <path> --file <local>
@@ -34,6 +35,8 @@ Commands:
   blueprint:publish <wsId> <gadgetId> [--title t] [--desc d]
                                                       publish a gadget as a blueprint
   blueprint:install <blueprintId>                    instantiate a workspace from a blueprint
+  blueprint:delete <wsId> <blueprintId> --confirm <blueprintId>
+                                                      remove a workspace-owned blueprint
   outputs:list                                       list all workspace outputs
   rpc <wsId> <method> [jsonArg ...]                  call a gadget's own RPC method; args are JSON
   context:list [collectionId] [prefix]                list Context collections or documents
@@ -105,6 +108,14 @@ async function main(): Promise<void> {
     case "ws:show":
       result = await cmds.wsShow(need(positional[0], "usage: os-client ws:show <id>"));
       break;
+    case "ws:delete": {
+      const wsId = need(positional[0], "usage: os-client ws:delete <id> --confirm <id>");
+      if (flags.confirm !== wsId) {
+        throw new Error("ws:delete requires --confirm with the exact workspace id");
+      }
+      result = await cmds.wsDelete(wsId);
+      break;
+    }
     case "gadget:create":
       result = await cmds.gadgetCreate(
         need(positional[0], "usage: os-client gadget:create <wsId> <title>"),
@@ -166,6 +177,16 @@ async function main(): Promise<void> {
         need(positional[0], "usage: os-client blueprint:install <blueprintId>"),
       );
       break;
+    case "blueprint:delete": {
+      const usageText = "usage: os-client blueprint:delete <wsId> <blueprintId> --confirm <blueprintId>";
+      const wsId = need(positional[0], usageText);
+      const blueprintId = need(positional[1], usageText);
+      if (flags.confirm !== blueprintId) {
+        throw new Error("blueprint:delete requires --confirm with the exact blueprint id");
+      }
+      result = await cmds.blueprintDelete(wsId, blueprintId);
+      break;
+    }
     case "outputs:list":
       result = await cmds.outputsList();
       break;
