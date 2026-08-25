@@ -189,6 +189,17 @@ const HANDSHAKE_GADGET_WAIT_MS = 250
 // runs, so a healthy frame handshakes within milliseconds of load.
 const HANDSHAKE_WATCHDOG_MS = HANDSHAKE_CONNECT_TIMEOUT_MS * HANDSHAKE_CONNECT_ATTEMPTS + 5_000
 
+// Recovery ladder for a gadget stub that breaks *after* the frame is connected -- which is what a
+// flapping backend socket does to every capability the page holds. Backs off so a sustained outage
+// does not become a reconnect storm, and ends in a visible error rather than retrying forever.
+const STUB_RECOVERY_ATTEMPTS = 4
+const STUB_RECOVERY_BASE_MS = 500
+// How long a connection must survive before it counts as proof the backend is healthy again. A
+// connection that establishes and then immediately dies is the *signature* of a flap, not a
+// recovery from one, so it must not refill the budget -- otherwise the ladder resets every cycle
+// and retries forever, which is the reconnect storm it exists to prevent.
+const STUB_RECOVERY_STABLE_MS = 10_000
+
 export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={props.chatId} {...props} />
 }
@@ -218,6 +229,12 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   // Whether the current iframe has ever been heard from. Distinguishes "we answered badly" from
   // "it never spoke to us", which are different bugs with the same blank symptom.
   const handshakeSeenRef = useRef(false)
+  // Recovery ladder state for a stub that breaks after the frame is connected. Reset by any
+  // connection that actually settles, so a healthy session always starts from a full budget.
+  const recoveryAttemptsRef = useRef(0)
+  const recoveryTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  // When the current connection was established, so a break can tell a blip from a flap.
+  const connectionSettledAtRef = useRef(0)
   const gadgetRef = useRef(gadget)
   gadgetRef.current = gadget
   const chatIdRef = useRef(chatId)
@@ -281,8 +298,37 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   const installGadgetStub = (stub: any) => {
     gadgetStubRef.current = stub
     stub.onRpcBroken?.(() => {
-      if (gadgetStubRef.current === stub) suspendGadgetCalls()
+      if (gadgetStubRef.current === stub) handleStubBroken()
     })
+  }
+
+  // A gadget stub that breaks after the frame is connected used to raise the call-suspension gate
+  // and stop there, waiting for a `gadget` prop change to lower it again. That is a bad bet: when
+  // the backend socket flaps, every capability the page holds breaks at once, and the prop change
+  // that would resolve the gate may never come. The frame is then blank *with a live session* --
+  // its calls parked on a promise nobody will ever settle -- which is invisible to the handshake
+  // watchdog and produces exactly the reported symptom: full bundle, no error, nothing painted.
+  //
+  // So recover on our own: reconnect against whatever `gadget` is current, backing off, and give
+  // up visibly rather than silently.
+  const handleStubBroken = () => {
+    suspendGadgetCalls()
+    if (recoveryTimerRef.current !== undefined) return  // a recovery is already scheduled
+    // Only a connection that lasted counts as recovery; see STUB_RECOVERY_STABLE_MS.
+    if (Date.now() - connectionSettledAtRef.current >= STUB_RECOVERY_STABLE_MS) {
+      recoveryAttemptsRef.current = 0
+    }
+    if (recoveryAttemptsRef.current >= STUB_RECOVERY_ATTEMPTS) {
+      console.error('Gadget connection kept breaking; giving up after',
+        STUB_RECOVERY_ATTEMPTS, 'attempts.')
+      setError('Lost the connection to this gadget.')
+      return
+    }
+    const delay = STUB_RECOVERY_BASE_MS * 2 ** recoveryAttemptsRef.current++
+    recoveryTimerRef.current = setTimeout(() => {
+      recoveryTimerRef.current = undefined
+      redirectToCurrentGadget()
+    }, delay)
   }
 
   const resetConnection = (reason: unknown) => {
@@ -386,6 +432,9 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         pendingStub.resolve(replacementStub)
         if (pendingGadgetStubRef.current === pendingStub) pendingGadgetStubRef.current = null
         oldStub?.[Symbol.dispose]?.()
+        // Start the clock rather than refilling the budget here: only a connection that *survives*
+        // proves the backend is healthy, and that is judged when it next breaks.
+        connectionSettledAtRef.current = Date.now()
       } catch (caught) {
         if (isCurrent()) reloadIframe(caught)
       } finally {
@@ -438,10 +487,15 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     if (!sandboxedHtml || !isVisible) return
     handshakeSeenRef.current = false
     const watchdog = setTimeout(() => {
-      if (rpcSessionRef.current) return
-      const detail = handshakeSeenRef.current
-        ? 'its connection never completed'
-        : 'it never sent a handshake'
+      // A session is not enough: calls still parked on the suspension gate are just as blank to
+      // the user as a frame that never connected, and that is the state a flapping backend leaves
+      // behind. Treat "connected but suspended this long" as the failure it looks like.
+      if (rpcSessionRef.current && !pendingGadgetStubRef.current) return
+      const detail = !handshakeSeenRef.current
+        ? 'it never sent a handshake'
+        : rpcSessionRef.current
+          ? 'its calls are still suspended waiting for a working connection'
+          : 'its connection never completed'
       console.error(`Gadget UI frame is still unconnected after ${HANDSHAKE_WATCHDOG_MS}ms: ${detail}.`)
       setError('This view never finished connecting.')
     }, HANDSHAKE_WATCHDOG_MS)
@@ -593,6 +647,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           const isStale = targetGeneration !== targetGenerationRef.current ||
             generation !== connectionGenerationRef.current
           if (isStale) suspendGadgetCalls()
+          connectionSettledAtRef.current = Date.now()
           installGadgetStub(gadgetStub)
           // Redirectable target: swapping gadgetStubRef reconnects top-level calls without reloading.
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
@@ -641,6 +696,10 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     return () => {
       cancelled = true
       window.removeEventListener('message', handleMessage)
+      if (recoveryTimerRef.current !== undefined) {
+        clearTimeout(recoveryTimerRef.current)
+        recoveryTimerRef.current = undefined
+      }
       resetConnection(new Error('Gadget RPC session was closed.'))
     }
   }, [])

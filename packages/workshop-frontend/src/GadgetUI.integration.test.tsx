@@ -148,6 +148,19 @@ function deferred<T>() {
   return { promise, reject, resolve }
 }
 
+// A gadget connection that can actually *break* the way a real one does. A plain local RpcStub
+// never fires `onRpcBroken`, so a real capnweb session over a MessageChannel is the only faithful
+// way to model a backend socket dropping under an already-connected frame.
+function breakableConnection(value: string) {
+  const { port1, port2 } = new MessageChannel()
+  const host = newMessagePortRpcSession(port2, new TestGadgetTarget(value))
+  const client = newMessagePortRpcSession<TestGadget>(port1)
+  return {
+    stub: client as unknown as RpcStub<TestGadget>,
+    break: () => host[Symbol.dispose](),
+  }
+}
+
 // A connect that hangs rather than fails: the shape of an in-flight pipelined call whose stub was
 // disposed under it. It is not a rejection, so nothing downstream ever hears about it.
 function neverSettles() {
@@ -776,4 +789,63 @@ describe('GadgetUI RPC recovery', () => {
     expect(container.querySelector('iframe')).toBe(iframe)
     await expect(child.read()).resolves.toBe('healthy')
   })
+
+  // ── a stub that breaks under a connected frame ────────────────────────────────
+  //
+  // When the backend RPC socket flaps, every capability the page holds breaks at once. The frame
+  // keeps its session, so the handshake watchdog stays quiet, but its calls are parked on the
+  // suspension gate -- and the gate used to be lowered only by a `gadget` prop change, which a
+  // flap does not reliably produce. The result was a blank pane with a live session and no error:
+  // invisible to every guard, and exactly what prod showed.
+
+  it('recovers on its own when the gadget stub breaks and no new prop arrives', async () => {
+    const first = breakableConnection('first')
+    const connectToGadget = vi.fn<() => Promise<RpcStub<TestGadget>>>()
+      .mockResolvedValueOnce(first.stub)
+      .mockResolvedValue(breakableConnection('recovered').stub)
+    const gadget = fakeGadget('gadget', 'document.body.textContent = "gadget"', connectToGadget)
+
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+    const child = connectIframe(iframe)
+    await expect(child.read()).resolves.toBe('first')
+
+    // The backend drops the connection. Crucially, nothing re-renders afterwards: no new stub, no
+    // new chatId, no reload. The component is on its own.
+    await act(async () => {
+      first.break()
+      await Promise.resolve()
+    })
+
+    await vi.waitFor(() => expect(connectToGadget).toHaveBeenCalledTimes(2), { timeout: 5_000 })
+    expect(container.querySelector('iframe')).toBe(iframe)
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+    await expect(child.read()).resolves.toBe('recovered')
+  })
+
+  it('gives up visibly when the gadget connection will not stay up', async () => {
+    // A sustained outage must not become an endless reconnect loop, and must not end in silence.
+    const connectToGadget = vi.fn<() => Promise<RpcStub<TestGadget>>>(async () => {
+      const connection = breakableConnection('doomed')
+      // Breaks as soon as it is handed over, so every recovery attempt fails the same way.
+      queueMicrotask(() => connection.break())
+      return connection.stub
+    })
+    const gadget = fakeGadget('gadget', 'document.body.textContent = "gadget"', connectToGadget)
+
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    connectIframe(container.querySelector('iframe')!)
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="gadget-error"]')).not.toBeNull()
+    }, { timeout: 20_000 })
+    // Bounded: the ladder stops rather than reconnecting forever.
+    expect(connectToGadget.mock.calls.length).toBeLessThanOrEqual(8)
+  }, 30_000)
 })
