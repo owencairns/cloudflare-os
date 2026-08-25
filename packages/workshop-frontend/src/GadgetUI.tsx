@@ -168,6 +168,27 @@ interface GadgetUIProps {
 const UI_BUNDLE_LOAD_TIMEOUT_MS = 20_000
 const RECONNECT_TIMEOUT_MS = 5_000
 
+// The gadget's own script posts its handshake and then blocks on RPC before painting anything, so a
+// handshake we never answer is an indefinitely blank pane with no error in it -- the frame is
+// waiting on a promise that never settles, so its `try/catch` never runs either. Every path out of
+// the handshake is therefore bounded, and ends in either a session or a visible error.
+//
+// The connect is the part that can hang rather than fail. `gadget` is a *pipelined* stub
+// (GadgetEditor hands over `overseer.stub.getGadget(id)` without awaiting it), and when the editor
+// re-derives it -- which is exactly what a code:merge does -- that effect's cleanup disposes the old
+// stub. An in-flight pipelined call on a disposed stub is cancelled, and a cancelled call is not a
+// rejected one: it simply never settles. So we retry instead of awaiting forever, and each attempt
+// re-reads `gadgetRef`, which by then holds the replacement.
+const HANDSHAKE_CONNECT_TIMEOUT_MS = 6_000
+const HANDSHAKE_CONNECT_ATTEMPTS = 3
+// How long to wait for a `gadget` prop when a handshake arrives before one is available.
+const HANDSHAKE_GADGET_WAIT_MS = 250
+// Last line of defence, covering causes we have not diagnosed (a handshake that never reaches the
+// listener, a frame whose script dies before posting one). Generous enough that it can only fire
+// when something is genuinely wrong: the injected prefix posts the handshake before any gadget code
+// runs, so a healthy frame handshakes within milliseconds of load.
+const HANDSHAKE_WATCHDOG_MS = HANDSHAKE_CONNECT_TIMEOUT_MS * HANDSHAKE_CONNECT_ATTEMPTS + 5_000
+
 export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={props.chatId} {...props} />
 }
@@ -194,6 +215,9 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   // the whole damping mechanism -- it is read, never waited on, so churn can never restart the
   // handshake.
   const targetGenerationRef = useRef(0)
+  // Whether the current iframe has ever been heard from. Distinguishes "we answered badly" from
+  // "it never spoke to us", which are different bugs with the same blank symptom.
+  const handshakeSeenRef = useRef(false)
   const gadgetRef = useRef(gadget)
   gadgetRef.current = gadget
   const chatIdRef = useRef(chatId)
@@ -277,6 +301,62 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     setIframeGeneration(generation => generation + 1)
   }
 
+  // Open a gadget connection on behalf of a frame that is blocked on its handshake. Bounded by
+  // construction: at most HANDSHAKE_CONNECT_ATTEMPTS attempts, each with its own deadline, so the
+  // caller either gets a stub, learns the frame is gone (`null`), or gets an error to show. It
+  // never waits indefinitely on one attempt, which is the whole point -- see the note on
+  // HANDSHAKE_CONNECT_TIMEOUT_MS for why an attempt can hang instead of failing.
+  //
+  // `gadgetRef`/`chatIdRef` are re-read per attempt rather than captured, so a retry naturally
+  // targets whatever replaced the stub that hung.
+  const connectForHandshake = async (isFrameCurrent: () => boolean): Promise<any> => {
+    let lastError: unknown = new Error('Could not open a gadget connection for the UI frame.')
+
+    for (let attempt = 0; attempt < HANDSHAKE_CONNECT_ATTEMPTS; attempt++) {
+      if (!isFrameCurrent()) return null
+
+      const target = gadgetRef.current
+      if (!target) {
+        // A handshake can beat the stub it needs. Waiting costs an attempt but nothing else, and
+        // the frame is held rather than abandoned.
+        lastError = new Error('No gadget client was available for the UI frame.')
+        await new Promise(resolve => setTimeout(resolve, HANDSHAKE_GADGET_WAIT_MS))
+        continue
+      }
+
+      // A timed-out attempt is abandoned, not cancelled -- there is no way to cancel it. If it ever
+      // does land, dispose it, so giving up on it cannot leak the capability. The flag has to be
+      // set by whoever gives up (the timeout, or a rejection) rather than cleared by the winner:
+      // this handler is registered before `Promise.race`'s own, so it always runs first, and a
+      // "have we taken it yet" test would read false on the very attempt we are about to use.
+      let abandoned = false
+      const attemptPromise = Promise.resolve().then(() => target.connectToGadget(chatIdRef.current))
+      void attemptPromise.then(stub => {
+        if (abandoned) stub?.[Symbol.dispose]?.()
+      }, () => {})
+
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race([
+          attemptPromise,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              abandoned = true
+              reject(new Error('Timed out opening the gadget connection.'))
+            }, HANDSHAKE_CONNECT_TIMEOUT_MS)
+          }),
+        ])
+      } catch (caught) {
+        abandoned = true
+        lastError = caught
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
+      }
+    }
+
+    throw lastError
+  }
+
   // Point the live RPC session at whatever `gadget`/`chatId` are current, without touching the
   // iframe. Top-level calls are suspended on a promise until the replacement stub lands, so nothing
   // reaches the outgoing stub in the meantime and nothing is dropped.
@@ -346,6 +426,27 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     }
     redirectToCurrentGadget()
   }, [gadget, chatId])
+
+  // Watchdog over the whole handshake, per mounted iframe.
+  //
+  // Everything above bounds the paths it knows about. This bounds the ones it does not: a handshake
+  // that never reaches the listener, a frame whose script dies before posting one, a handler that
+  // throws somewhere unforeseen. The product defect being fixed is not any single one of those --
+  // it is that a gadget pane can sit blank and silent indefinitely, telling the user nothing. A
+  // frame that is not connected by the deadline gets an error with a retry instead.
+  useEffect(() => {
+    if (!sandboxedHtml || !isVisible) return
+    handshakeSeenRef.current = false
+    const watchdog = setTimeout(() => {
+      if (rpcSessionRef.current) return
+      const detail = handshakeSeenRef.current
+        ? 'its connection never completed'
+        : 'it never sent a handshake'
+      console.error(`Gadget UI frame is still unconnected after ${HANDSHAKE_WATCHDOG_MS}ms: ${detail}.`)
+      setError('This view never finished connecting.')
+    }, HANDSHAKE_WATCHDOG_MS)
+    return () => clearTimeout(watchdog)
+  }, [sandboxedHtml, isVisible, iframeGeneration, reloadTrigger])
 
   // Effect to handle reloadTrigger changes (code changes)
   useEffect(() => {
@@ -435,9 +536,16 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       // from the null origin, just in case somehow the frame managed to browse away (though that
       // should be blocked). Yes, the null origin is identified by the string value "null", not the
       // JS `null`.
-      if (event.source !== iframeRef.current?.contentWindow ||
-          event.origin !== "null") {
-        return
+      if (event.origin !== "null") return
+      const isFromOurFrame = () => event.source === iframeRef.current?.contentWindow
+      if (!isFromOurFrame()) {
+        // A handshake carries the frame's only port, so dropping one strands that frame for good.
+        // Before dropping, allow for the ref simply not being attached yet: re-check on the next
+        // task, by which point React has certainly committed. A message from a genuinely foreign
+        // or superseded frame still fails the re-check and is still ignored.
+        if (iframeRef.current !== null || event.data !== 'handshake') return
+        await new Promise(resolve => setTimeout(resolve, 0))
+        if (cancelled || !isFromOurFrame()) return
       }
 
       if (event.data === 'handshake' && event.ports && event.ports[0]) {
@@ -449,17 +557,29 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         resetConnection(new Error('Gadget iframe reloaded.'))
         const generation = connectionGenerationRef.current
         handshakePendingRef.current = generation
-        const isCurrent = () => !cancelled &&
-          generation === connectionGenerationRef.current &&
+        handshakeSeenRef.current = true
+        // Frame identity, deliberately kept separate from connection-generation staleness. They are
+        // different questions and they want opposite answers: a frame that is gone owes us nothing,
+        // while a frame that is still on screen is *waiting*, and staleness is a reason to redirect
+        // it -- never a reason to leave it hanging.
+        const isFrameCurrent = () => !cancelled &&
           event.source === iframeRef.current?.contentWindow
         // Sampled *before* the call so a `gadget`/`chatId` change that lands while it is in flight
         // is detectable afterwards. This effect has no deps, so the refs -- not the closure -- are
         // the only honest reading of the current props.
         const targetGeneration = targetGenerationRef.current
         try {
-          // Open the RPC connection to the gadget's server side
-          gadgetStub = await gadgetRef.current.connectToGadget(chatIdRef.current)
-          if (!isCurrent()) {
+          // Open the RPC connection to the gadget's server side, bounded and retried.
+          gadgetStub = await connectForHandshake(isFrameCurrent)
+          if (gadgetStub === null || !isFrameCurrent()) {
+            // The frame went away while we were connecting. Nothing is waiting on this port.
+            gadgetStub?.[Symbol.dispose]?.()
+            port.close()
+            return
+          }
+          if (generation !== connectionGenerationRef.current && rpcSessionRef.current !== null) {
+            // Somebody else already connected this frame. Stand down rather than clobber the live
+            // session -- "exactly one session per frame" is the invariant that keeps it painting.
             gadgetStub[Symbol.dispose]?.()
             port.close()
             return
@@ -470,7 +590,8 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           // replacement instead of routing it to the stale stub. The redirect at the end of this
           // block resolves that gate. The frame gets exactly one session, and exactly one settled
           // connection behind it.
-          const isStale = targetGeneration !== targetGenerationRef.current
+          const isStale = targetGeneration !== targetGenerationRef.current ||
+            generation !== connectionGenerationRef.current
           if (isStale) suspendGadgetCalls()
           installGadgetStub(gadgetStub)
           // Redirectable target: swapping gadgetStubRef reconnects top-level calls without reloading.
@@ -496,7 +617,10 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
-          if (!isCurrent()) return
+          if (!isFrameCurrent()) return
+          // The frame is on screen and will never paint by itself, so this has to be said out loud.
+          // Closing the port does not tell it anything: the peer of a closed MessagePort is not
+          // notified, and it has no session on that port to break in the first place.
           console.error('Failed to establish RPC connection:', caught)
           setError('Failed to connect gadget to server')
         } finally {

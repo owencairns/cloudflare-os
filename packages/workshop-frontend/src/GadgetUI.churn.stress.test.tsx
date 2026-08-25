@@ -32,7 +32,13 @@ afterAll(() => {
 })
 
 vi.mock('@cloudflare/kumo', () => ({
-  Banner: () => null,
+  // Rendered so a trial can tell "failed visibly" (acceptable) from "blank and silent" (the bug).
+  Banner: Object.assign(
+    ({ description }: { description?: ReactNode }) => (
+      <div data-testid="gadget-error">{description}</div>
+    ),
+    { Action: ({ children }: { children?: ReactNode }) => children },
+  ),
   Loader: () => null,
   Text: ({ children }: { children: ReactNode }) => children,
 }))
@@ -189,4 +195,104 @@ describe('GadgetUI gadget-prop churn stress', () => {
     )
     expect({ remounts, unconnected, stale }).toEqual({ remounts: 0, unconnected: 0, stale: 0 })
   }, 120_000)
+
+  // ── hang injection ────────────────────────────────────────────────────────────
+  //
+  // The residual prod failure was not churn but a connect that *hangs*: `gadget` is a pipelined
+  // stub, and a call in flight when the editor disposes it is cancelled rather than rejected, so it
+  // never settles. This injects that at a randomized rate and asserts the only property that
+  // actually matters to a user: the pane ends up either working or visibly failed. Never blank and
+  // silent.
+  //
+  // Fake timers throughout, because the recovery is driven by the retry deadlines.
+  const HANDSHAKE_TIMEOUT_MS = 6_000
+  const HANDSHAKE_ATTEMPTS = 3
+  const WATCHDOG_MS = HANDSHAKE_TIMEOUT_MS * HANDSHAKE_ATTEMPTS + 5_000
+
+  function hangingGadget(value: string) {
+    const connectToGadget = vi.fn<() => Promise<RpcStub<TestGadget>>>(
+      () => new Promise<never>(() => {}),
+    )
+    const getUiBundle = vi.fn<() => Promise<UiBundle>>(async () => ({
+      jsCode: `document.body.textContent = ${JSON.stringify(value)}`,
+    }))
+    return { connectToGadget, stub: { connectToGadget, getUiBundle } as unknown as RpcStub<GadgetClient> }
+  }
+
+  it(`never leaves a blank silent pane across ${TRIALS} randomized hang trials`, async () => {
+    const random = makeRandom(SEED ^ 0x9e37)
+    let blankAndSilent = 0
+    let recovered = 0
+    let visiblyFailed = 0
+
+    for (let trial = 0; trial < TRIALS; trial++) {
+      vi.useFakeTimers()
+
+      // The opening stub hangs most of the time -- that is the case under test.
+      const opensHang = random() < 0.75
+      const first = opensHang ? hangingGadget('trial-0') : fakeGadget('trial-0', 0)
+      await act(async () => {
+        root.render(<GadgetUI gadget={first.stub} height="100px" />)
+      })
+      const iframe = container.querySelector('iframe')
+      expect(iframe).not.toBeNull()
+
+      const { port1, port2 } = new MessageChannel()
+      const child = newMessagePortRpcSession<TestGadget>(port1)
+      childSessions.push(child)
+      window.dispatchEvent(new MessageEvent('message', {
+        data: 'handshake',
+        origin: 'null',
+        source: iframe!.contentWindow,
+        ports: [port2],
+      }))
+
+      // Some trials get a healthy replacement (the editor re-deriving the stub after a merge),
+      // some stay broken -- so both the recovery path and the give-up path are exercised.
+      const rescued = random() < 0.6
+      if (rescued) {
+        await act(async () => vi.advanceTimersByTimeAsync(Math.floor(random() * HANDSHAKE_TIMEOUT_MS)))
+        const replacement = fakeGadget('trial-rescued', 0)
+        await act(async () => {
+          root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
+        })
+      }
+
+      // Run past every deadline the component owns.
+      await act(async () => vi.advanceTimersByTimeAsync(WATCHDOG_MS + 2_000))
+      vi.useRealTimers()
+
+      let answered = false
+      try {
+        answered = await Promise.race([
+          child.read().then(() => true, () => false),
+          new Promise<boolean>(resolve => setTimeout(() => resolve(false), 100)),
+        ])
+      } catch {
+        answered = false
+      }
+      const errorShown = container.querySelector('[data-testid="gadget-error"]') !== null
+
+      if (answered) recovered++
+      else if (errorShown) visiblyFailed++
+      else blankAndSilent++
+
+      for (const session of childSessions.splice(0)) session[Symbol.dispose]()
+      await act(async () => root.unmount())
+      container.remove()
+      container = document.createElement('div')
+      document.body.append(container)
+      root = createRoot(container)
+    }
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `hang stress: trials=${TRIALS} recovered=${recovered} visiblyFailed=${visiblyFailed} blankAndSilent=${blankAndSilent}`,
+    )
+    // The assertion is deliberately only about the defect. Whether a given trial recovers or fails
+    // depends on whether a working stub ever showed up; being left blank with no signal is never OK.
+    expect(blankAndSilent).toBe(0)
+    expect(recovered).toBeGreaterThan(0)
+    expect(visiblyFailed).toBeGreaterThan(0)
+  }, 300_000)
 })

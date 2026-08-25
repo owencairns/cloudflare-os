@@ -19,7 +19,14 @@ afterAll(() => {
 })
 
 vi.mock('@cloudflare/kumo', () => ({
-  Banner: () => null,
+  // Rendered (rather than stubbed to null) so tests can assert the frame's failure is *visible*.
+  // A blank pane with no signal is the defect; "an error was set" is the fix.
+  Banner: Object.assign(
+    ({ description }: { description?: ReactNode }) => (
+      <div data-testid="gadget-error">{description}</div>
+    ),
+    { Action: ({ children }: { children?: ReactNode }) => children },
+  ),
   Loader: () => null,
   Text: ({ children }: { children: ReactNode }) => children,
 }))
@@ -139,6 +146,16 @@ function deferred<T>() {
     reject = rejectPromise
   })
   return { promise, reject, resolve }
+}
+
+// A connect that hangs rather than fails: the shape of an in-flight pipelined call whose stub was
+// disposed under it. It is not a rejection, so nothing downstream ever hears about it.
+function neverSettles() {
+  return new Promise<never>(() => {})
+}
+
+async function advance(ms: number) {
+  await act(async () => vi.advanceTimersByTimeAsync(ms))
 }
 
 function dispatchIframeHandshake(iframe: HTMLIFrameElement, port: MessagePort) {
@@ -631,5 +648,132 @@ describe('GadgetUI RPC recovery', () => {
       const reloaded = connectIframe(container.querySelector('iframe')!)
       await expect(reloaded.read()).resolves.toBe(`churned-${round}`)
     }
+  })
+
+  // ── a handshake that is never answered ────────────────────────────────────────
+  //
+  // The residual prod failure after the remount fix: the iframe exists with its full bundle, no
+  // error panel is painted, and nothing ever appears. The gadget's own script posts its handshake
+  // and then awaits RPC before its first paint, so its try/catch cannot help -- an unanswered
+  // handshake is a promise that never settles, not one that rejects. Every one of these asserts
+  // that the frame ends up either connected or visibly failed, never silently waiting.
+
+  const HANDSHAKE_TIMEOUT_MS = 6_000
+  const WATCHDOG_MS = 23_000
+
+  // Fake timers only capture timers scheduled after they are installed, and the deadlines under
+  // test are armed as the frame mounts -- so these tests have to be faked from the very start. The
+  // bundle load resolves through microtasks, which `act` flushes regardless.
+  async function renderFaked(ui: Parameters<Root['render']>[0]) {
+    await act(async () => {
+      root.render(ui)
+    })
+  }
+
+
+  it('retries onto the replacement stub when the first connect hangs instead of failing', async () => {
+    // `gadget` is a pipelined stub; when GadgetEditor re-derives it (which is what a code:merge
+    // does) the old one is disposed, and an in-flight pipelined call on a disposed stub is
+    // *cancelled* -- it never settles and never rejects. Awaiting it unbounded strands the frame.
+    vi.useFakeTimers()
+    const hung = fakeGadget('hung', 'document.body.textContent = "hung"', vi.fn(neverSettles))
+    await renderFaked(<GadgetUI gadget={hung.stub} height="100px" />)
+    const iframe = container.querySelector('iframe')!
+    expect(iframe).not.toBeNull()
+    const child = connectIframe(iframe)
+
+    // The editor swaps in a working stub, exactly as it does after the merge settles.
+    const replacement = fakeGadget('replacement', 'unused')
+    await renderFaked(<GadgetUI gadget={replacement.stub} height="100px" />)
+    expect(replacement.connectToGadget).not.toHaveBeenCalled()
+
+    await advance(HANDSHAKE_TIMEOUT_MS)
+    vi.useRealTimers()
+
+    // The hung attempt is abandoned and the retry lands on the stub that works.
+    await vi.waitFor(() => expect(replacement.connectToGadget).toHaveBeenCalled())
+    expect(container.querySelector('iframe')).toBe(iframe)
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+    await expect(child.read()).resolves.toBe('replacement')
+  })
+
+  it('waits for a gadget stub that has not arrived when the frame handshakes', async () => {
+    const first = fakeGadget('first', 'document.body.textContent = "first"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={first.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+
+    // The bundle is already loaded, so the frame stays mounted while the stub goes missing.
+    await act(async () => {
+      root.render(<GadgetUI gadget={undefined as never} height="100px" />)
+    })
+    const child = connectIframe(iframe)
+
+    const arrived = fakeGadget('arrived', 'unused')
+    await act(async () => {
+      root.render(<GadgetUI gadget={arrived.stub} height="100px" />)
+    })
+
+    vi.useFakeTimers()
+    await act(async () => vi.advanceTimersByTimeAsync(500))
+    vi.useRealTimers()
+
+    await vi.waitFor(() => expect(arrived.connectToGadget).toHaveBeenCalled())
+    expect(container.querySelector('iframe')).toBe(iframe)
+    await expect(child.read()).resolves.toBe('arrived')
+  })
+
+  it('shows a visible error when every connect attempt hangs', async () => {
+    vi.useFakeTimers()
+    const hung = fakeGadget('hung', 'document.body.textContent = "hung"', vi.fn(neverSettles))
+    await renderFaked(<GadgetUI gadget={hung.stub} height="100px" />)
+    expect(container.querySelector('iframe')).not.toBeNull()
+    connectIframe(container.querySelector('iframe')!)
+
+    await advance(HANDSHAKE_TIMEOUT_MS * 3 + 1_000)
+    vi.useRealTimers()
+
+    // Bounded: it gives up rather than retrying forever, and it says so on screen.
+    expect(hung.connectToGadget).toHaveBeenCalledTimes(3)
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="gadget-error"]')).not.toBeNull()
+    })
+    expect(container.querySelector('iframe')).toBeNull()
+  })
+
+  it('surfaces an error when the frame never handshakes at all', async () => {
+    // Covers the causes we have not diagnosed: a handshake lost before it reaches the listener, or
+    // a frame whose script dies before posting one. The pane must not stay blank and silent.
+    vi.useFakeTimers()
+    const silent = fakeGadget('silent', 'document.body.textContent = "silent"')
+    await renderFaked(<GadgetUI gadget={silent.stub} height="100px" />)
+    expect(container.querySelector('iframe')).not.toBeNull()
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+
+    await advance(WATCHDOG_MS + 1_000)
+    vi.useRealTimers()
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="gadget-error"]')).not.toBeNull()
+    })
+  })
+
+  it('leaves a healthy frame alone once the watchdog deadline passes', async () => {
+    vi.useFakeTimers()
+    const healthy = fakeGadget('healthy', 'document.body.textContent = "healthy"')
+    await renderFaked(<GadgetUI gadget={healthy.stub} height="100px" />)
+    const iframe = container.querySelector('iframe')!
+    expect(iframe).not.toBeNull()
+    const child = connectIframe(iframe)
+    await advance(0)
+
+    await advance(WATCHDOG_MS * 2)
+    vi.useRealTimers()
+
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+    expect(container.querySelector('iframe')).toBe(iframe)
+    await expect(child.read()).resolves.toBe('healthy')
   })
 })
