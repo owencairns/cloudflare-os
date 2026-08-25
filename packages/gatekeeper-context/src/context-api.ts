@@ -6,7 +6,8 @@ import { validateRpc } from "capnweb-validate";
 import {
   ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
   ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
-  ContextLibraryBackup, ContextLibraryImportResult, DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
+  ContextLibraryBackup, ContextLibraryImportResult, ContextSearchResult,
+  DEFAULT_GIT_BRANCH, EnabledCollectionInfo, encodeDocId,
 } from "./context-types.js";
 import { normalizeContextLibraryBackup } from "./context-backup.js";
 import type { ContextCollectionDurableObject } from "./context-collection.js";
@@ -266,6 +267,28 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
 
   async listEnabledContextCollections(): Promise<EnabledCollectionInfo[]> {
     return loadEnabledContextCollections(this.env, this.domain, this.#userLib());
+  }
+
+  async searchContextLibrary(
+      query: string,
+      options: { collectionId?: string; limit?: number } = {}): Promise<ContextSearchResult[]> {
+    let enabled = await this.listEnabledContextCollections();
+    let targets = options.collectionId
+      ? enabled.filter(collection => collection.id === options.collectionId)
+      : enabled;
+    let limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 20)));
+    let hits = (await Promise.all(targets.map(async collection =>
+      (await this.#collection(collection.id).search(query, limit)).map(hit => ({
+        docId: encodeDocId(collection.id, hit.path),
+        collectionId: collection.id,
+        title: hit.name,
+        path: hit.path,
+        description: hit.description,
+        snippet: hit.snippet,
+        score: hit.score,
+      })),
+    ))).flat();
+    return hits.toSorted((left, right) => (right.score ?? 0) - (left.score ?? 0)).slice(0, limit);
   }
 
   async canWriteContextCollection(collectionId: string): Promise<boolean> {

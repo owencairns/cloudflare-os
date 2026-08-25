@@ -371,6 +371,11 @@ export interface ContextApi extends RpcTarget {
   moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void>;
   /** Own private collections plus every public one. */
   listEnabledContextCollections(): Promise<EnabledCollectionInfo[]>;
+  /** Search visible collections from the trusted management/CLI surface. */
+  searchContextLibrary(
+    query: string,
+    options?: { collectionId?: string; limit?: number },
+  ): Promise<ContextSearchResult[]>;
   /** Whether the viewer may edit this collection: own private collection, or public collection as admin. */
   canWriteContextCollection(collectionId: string): Promise<boolean>;
   /** Export every collection visible to this account as a self-contained JSON-safe snapshot. */

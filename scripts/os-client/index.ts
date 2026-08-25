@@ -35,8 +35,15 @@ Commands:
                                                       publish a gadget as a blueprint
   blueprint:install <blueprintId>                    instantiate a workspace from a blueprint
   outputs:list                                       list all workspace outputs
-  rpc <wsId> <method> [jsonArg ...]                  call a gadget's own RPC method (Tasks/Docs/
-                                                      Memory agent API); args are JSON values
+  rpc <wsId> <method> [jsonArg ...]                  call a gadget's own RPC method; args are JSON
+  context:list [collectionId] [prefix]                list Context collections or documents
+  context:search <query> [--limit n]                  full-text search Context
+  context:read <collectionId> <path>                  read one Context document
+  context:write <collectionId> <path> --file <md> --description <text>
+                                                      write one Markdown document
+  context:rpc <method> [jsonArg ...]                  call the current user's Context API
+  context:export --out <file>                         export Context to a JSON backup
+  context:import <file> [--mode merge|replace]        import a Context JSON backup
   admin:signups <on|off>                             toggle account signups (admin only)
 `;
 }
@@ -179,6 +186,65 @@ async function main(): Promise<void> {
         }
       });
       result = await cmds.gadgetRpc(wsId, method, args);
+      break;
+    }
+    case "context:rpc": {
+      const method = need(positional[0], "usage: os-client context:rpc <method> [jsonArg ...]");
+      const args = positional.slice(1).map((raw, i) => {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          throw new Error(`context:rpc arg #${i + 1} is not valid JSON: ${raw}`);
+        }
+      });
+      result = await cmds.contextRpc(method, args);
+      break;
+    }
+    case "context:list":
+      result = await cmds.contextList(positional[0], positional[1]);
+      break;
+    case "context:search": {
+      const rawLimit = flags.limit ?? "20";
+      const limit = Number(rawLimit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error("context:search --limit must be an integer from 1 to 100");
+      }
+      result = await cmds.contextSearch(
+        need(positional[0], "usage: os-client context:search <query> [--limit n]"),
+        limit,
+      );
+      break;
+    }
+    case "context:read":
+      result = await cmds.contextRead(
+        need(positional[0], "usage: os-client context:read <collectionId> <path>"),
+        need(positional[1], "usage: os-client context:read <collectionId> <path>"),
+      );
+      break;
+    case "context:write":
+      result = await cmds.contextWrite(
+        need(positional[0],
+          "usage: os-client context:write <collectionId> <path> --file <md> --description <text>"),
+        need(positional[1],
+          "usage: os-client context:write <collectionId> <path> --file <md> --description <text>"),
+        need(flags.file, "context:write requires --file <md>"),
+        need(flags.description, "context:write requires --description <text>"),
+      );
+      break;
+    case "context:export":
+      result = await cmds.contextExport(
+        need(flags.out, "usage: os-client context:export --out <file>"),
+      );
+      break;
+    case "context:import": {
+      const mode = flags.mode ?? "merge";
+      if (mode !== "merge" && mode !== "replace") {
+        throw new Error("context:import --mode must be 'merge' or 'replace'");
+      }
+      result = await cmds.contextImport(
+        need(positional[0], "usage: os-client context:import <file> [--mode merge|replace]"),
+        mode,
+      );
       break;
     }
     default:

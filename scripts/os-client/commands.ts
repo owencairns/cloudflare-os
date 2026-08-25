@@ -1,7 +1,7 @@
 // Command implementations for the os-client CLI. Each command returns a plain JSON-serializable
 // value; index.ts prints it.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { RpcStub, RpcTarget } from "capnweb";
 import type {
   Overseer,
@@ -376,7 +376,7 @@ export async function adminSignups(enabled: boolean): Promise<unknown> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// gadget RPC — the agent API for first-party gadgets (Tasks / Docs / Memory)
+// gadget RPC — the agent API for first-party gadgets
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -416,4 +416,88 @@ export async function gadgetRpc(
   } finally {
     disposeQuietly(pub);
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Context — the ambient company-knowledge surface
+// ---------------------------------------------------------------------------------------------
+
+async function withContextApi<T>(
+  fn: (api: RpcStub<Record<string, (...args: unknown[]) => Promise<unknown>>>) => Promise<T>,
+): Promise<T> {
+  const { pub, auth } = await connectAuthenticated();
+  try {
+    const frame = await auth.getGatekeeperApp("context");
+    if (!frame) throw new Error("The Context management app is not available.");
+    const api = frame.ui as RpcStub<Record<string, (...args: unknown[]) => Promise<unknown>>>;
+    try {
+      return await fn(api);
+    } finally {
+      disposeQuietly(api as RpcStub<unknown>);
+    }
+  } finally {
+    disposeQuietly(pub);
+  }
+}
+
+/** Call the trusted management capability exposed by the current user's Context account. */
+export async function contextRpc(method: string, args: unknown[]): Promise<unknown> {
+  return withContextApi(async api => {
+    const target = api as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
+    return target[method](...args);
+  });
+}
+
+/** List Context collections, or documents within one collection. */
+export async function contextList(collectionId?: string, prefix?: string): Promise<unknown> {
+  return collectionId
+    ? contextRpc("listContextDocuments", [collectionId, prefix])
+    : contextRpc("listEnabledContextCollections", []);
+}
+
+/** Full-text search across the current user's visible Context collections. */
+export async function contextSearch(query: string, limit: number): Promise<unknown> {
+  return contextRpc("searchContextLibrary", [query, { limit }]);
+}
+
+/** Read one Context document by collection id and path. */
+export async function contextRead(collectionId: string, path: string): Promise<unknown> {
+  return contextRpc("getContextDocument", [collectionId, path]);
+}
+
+/** Write one Markdown file into an owned Context collection. */
+export async function contextWrite(
+  collectionId: string,
+  path: string,
+  file: string,
+  description: string,
+): Promise<unknown> {
+  await contextRpc("putContextDocument", [
+    collectionId,
+    path,
+    { description, body: readFileSync(file, "utf8"), contentType: "text/markdown" },
+  ]);
+  return { collectionId, path, file };
+}
+
+/** Export Context to a JSON file without printing document bodies to the terminal. */
+export async function contextExport(file: string): Promise<unknown> {
+  let snapshot = await contextRpc("exportContextLibrary", []);
+  writeFileSync(file, JSON.stringify(snapshot, null, 2) + "\n");
+  let collections = (snapshot as { collections?: Array<{documents?: unknown[]}> }).collections ?? [];
+  return {
+    file,
+    collections: collections.length,
+    documents: collections.reduce((count, collection) =>
+      count + (collection.documents?.length ?? 0), 0),
+  };
+}
+
+/** Import a Context JSON backup through the same management capability as the web UI. */
+export async function contextImport(
+  file: string,
+  mode: "merge" | "replace",
+): Promise<unknown> {
+  let snapshot = JSON.parse(readFileSync(file, "utf8"));
+  return contextRpc("importContextLibrary", [snapshot, { mode }]);
 }
