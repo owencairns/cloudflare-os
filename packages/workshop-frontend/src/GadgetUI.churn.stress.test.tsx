@@ -55,8 +55,10 @@ class TestGadgetTarget extends RpcTarget implements TestGadget {
 
 // Trials default low so the suite stays fast; raise it to gather statistics:
 //   GADGET_CHURN_TRIALS=500 npx vitest run src/GadgetUI.churn.stress.test.tsx
-const TRIALS = Number(process.env.GADGET_CHURN_TRIALS ?? 40)
-const SEED = Number(process.env.GADGET_CHURN_SEED ?? 0x5eed)
+// Read through import.meta.env: this package typechecks as browser code, where `process` is absent.
+const testEnv = import.meta.env as unknown as Record<string, string | undefined>
+const TRIALS = Number(testEnv.GADGET_CHURN_TRIALS ?? 40)
+const SEED = Number(testEnv.GADGET_CHURN_SEED ?? 0x5eed)
 
 // mulberry32 -- small, fast, and deterministic, so a reported failure rate is reproducible.
 function makeRandom(seed: number) {
