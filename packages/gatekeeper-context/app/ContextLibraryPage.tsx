@@ -1058,8 +1058,8 @@ export default function ContextLibraryPage() {
   }
 
   return (
-    <div className="mx-auto flex h-full w-full max-w-4xl flex-col px-6 sm:px-10">
-      <header className="flex items-end justify-between gap-4 px-3 pb-3 pt-10">
+    <div className="mx-auto flex h-full w-full max-w-4xl flex-col px-3 sm:px-10">
+      <header className="flex flex-col items-stretch gap-4 px-3 pb-3 pt-8 sm:flex-row sm:items-end sm:justify-between sm:pt-10">
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
             Context &amp; Skills
@@ -1068,7 +1068,7 @@ export default function ContextLibraryPage() {
             Collections of documents, skills, and other files your agents can use.
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0 sm:items-center">
           <input
             ref={importInputRef}
             type="file"
@@ -1083,7 +1083,7 @@ export default function ContextLibraryPage() {
             type="button"
             onClick={() => importInputRef.current?.click()}
             disabled={importing}
-            className="press inline-flex h-9 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-3 text-[13px] font-medium tracking-[-0.25px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-wait disabled:opacity-50"
+            className="press inline-flex h-9 cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-3 text-[13px] font-medium tracking-[-0.25px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-wait disabled:opacity-50"
           >
             <UploadSimple size={14} />
             {importing ? "Importing…" : "Import"}
@@ -1092,7 +1092,7 @@ export default function ContextLibraryPage() {
             type="button"
             onClick={() => void handleExport()}
             disabled={exporting || enabled.length === 0}
-            className="press inline-flex h-9 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-3 text-[13px] font-medium tracking-[-0.25px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-not-allowed disabled:opacity-50"
+            className="press inline-flex h-9 cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-3 text-[13px] font-medium tracking-[-0.25px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-not-allowed disabled:opacity-50"
           >
             <DownloadSimple size={14} />
             {exporting ? "Exporting…" : "Export"}
@@ -1101,7 +1101,7 @@ export default function ContextLibraryPage() {
             <button
               type="button"
               onClick={() => setCreating(true)}
-              className="press inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover"
+              className="press col-span-2 inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover sm:col-span-1"
             >
               <Plus size={14} weight="bold" />
               New collection
