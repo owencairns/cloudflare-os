@@ -4222,6 +4222,23 @@ class OverseerImpl implements AgentHooks {
   // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
   async applyPendingAction(record: ActionRecord & {type: "action"},
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean): Promise<void> {
+    // Writes-to-self carve-out, re-checked at apply time: an action can outlive the policy it was
+    // submitted under (queued before a restricted observation latched the workspace, approved
+    // after), and the approval surfaces tell the user a latched workspace acts only on its
+    // restricted producers -- so the invariant must hold here, at the one place an action
+    // transitions to "approved", not just in submitAction. Checked synchronously before the facet
+    // call so a refused action is left untouched. The auto-approval drain already refuses via
+    // autoApprovalRule (nothing auto-applies while latched); this covers manual approval.
+    // rejectAction is deliberately NOT gated -- denying is how the user unsticks an agent turn
+    // suspended on awaitDecision.
+    if (this.storage.prohibitAllSharing.get() &&
+        !this.restrictedProducerIds().has(record.gatekeeperId)) {
+      throw new Error(
+          "This workspace has observed sensitive data from other connections. To prevent leaks, " +
+          "it may only perform actions on those same connections; this pending action targets " +
+          "another connection, so it can only be denied.");
+    }
+
     let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
     await gatekeeper.applyAction(record.action);
     record.state = "approved";
@@ -4623,8 +4640,9 @@ class OverseerImpl implements AgentHooks {
   // set. Built-in tool observations are skipped: they name no connection, and the
   // BUILTIN_TOOL_GATEKEEPER_ID sentinel could never match a gatekeeper record (built-ins also
   // never latch). The callers are cold paths (connection removal, sharing mutators) plus
-  // submitAction -- but the latter scans only while latched, and the auto-approval drainer
-  // already full-scans the log per drain, so the scan is fine where it runs.
+  // submitAction and applyPendingAction -- but both scan only while latched (the unlatched path
+  // short-circuits before the scan), latched manual approvals are human-bounded, and the
+  // auto-approval drainer already full-scans the log per drain, so the scan is fine where it runs.
   restrictedProducerIds(): Set<WorkpieceId> {
     let producers = new Set<WorkpieceId>();
     for (let record of this.storage.actions.list()) {
