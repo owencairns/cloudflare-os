@@ -135,6 +135,13 @@ export default function Activity({
     actionKind: ActionKind
     actionLabel: string
   } | null>(null)
+
+  // Dismiss an open confirmation when the workspace latches restricted mode: the affordance that
+  // opened it is already suppressed, and confirming could only error (setAutoApprovedActionKind
+  // refuses while restricted).
+  useEffect(() => {
+    if (restricted) setConfirmAutoApprove(null)
+  }, [restricted])
   const toasts = useKumoToastManager()
 
   const { pendingActions, historyGroups, historyTotal, historyShown } = useMemo(() => {
