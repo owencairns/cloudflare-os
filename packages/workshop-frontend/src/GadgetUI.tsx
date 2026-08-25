@@ -199,6 +199,30 @@ const STUB_RECOVERY_BASE_MS = 500
 // recovery from one, so it must not refill the budget -- otherwise the ladder resets every cycle
 // and retries forever, which is the reconnect storm it exists to prevent.
 const STUB_RECOVERY_STABLE_MS = 10_000
+// How long one forwarded gadget call may stay unsettled before the connection behind it is treated
+// as dead. This is the only guard here that measures the actual symptom -- "the frame asked and
+// never got an answer" -- instead of a proxy for it. Every other guard infers liveness from
+// `onRpcBroken`, which a *cancelled* call never fires: a pipelined stub disposed under an in-flight
+// call leaves a zombie that accepts calls and answers none, sitting behind a perfectly live
+// session. Generous, so a legitimately slow gadget method is not mistaken for a dead connection.
+const GADGET_CALL_STUCK_MS = 12_000
+
+// Opt-in host-side tracing for the gadget connection lifecycle: `?debug=gadget` on the workshop
+// URL. Every connect attempt, settle, reject and stuck call is timestamped, which is the trace a
+// browser repro can hand back when the failure is only reproducible behind a login.
+const GADGET_DEBUG = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('debug') === 'gadget'
+  } catch {
+    return false
+  }
+})()
+
+const debugGadget = (event: string, details?: Record<string, unknown>) => {
+  if (!GADGET_DEBUG) return
+  // eslint-disable-next-line no-console
+  console.log(`[gadget ${new Date().toISOString()}] ${event}`, details ?? {})
+}
 
 export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={props.chatId} {...props} />
@@ -235,6 +259,9 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   const recoveryTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   // When the current connection was established, so a break can tell a blip from a flap.
   const connectionSettledAtRef = useRef(0)
+  // Deadlines for forwarded calls that have not answered yet, cleared whenever the connection they
+  // belong to is torn down so a replacement never inherits the old one's suspicion.
+  const stuckCallTimersRef = useRef(new Set<ReturnType<typeof setTimeout>>())
   const gadgetRef = useRef(gadget)
   gadgetRef.current = gadget
   const chatIdRef = useRef(chatId)
@@ -315,6 +342,62 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   //
   // So recover on our own: reconnect against whatever `gadget` is current, backing off, and give
   // up visibly rather than silently.
+  // Watch one forwarded call without consuming it: attach an observer and hand the caller back the
+  // original, so capnweb's pipelining (`gadget.child().read()`) is untouched. `.then` on an
+  // RpcPromise is the genuine promise method -- capnweb observes its own promises the same way.
+  const watchForwardedCall = (result: any, property: string): any => {
+    const generation = connectionGenerationRef.current
+    const issuedAt = Date.now()
+    debugGadget('call issued', { method: property, generation })
+
+    const timer = setTimeout(() => {
+      stuckCallTimersRef.current.delete(timer)
+      if (generation !== connectionGenerationRef.current) return  // superseded; not this call's problem
+      console.error(
+        `Gadget call ${property}() has not settled after ${GADGET_CALL_STUCK_MS}ms; ` +
+        'treating the connection as dead.')
+      debugGadget('call stuck', { method: property, generation, waitedMs: Date.now() - issuedAt })
+      handleStuckConnection()
+    }, GADGET_CALL_STUCK_MS)
+    stuckCallTimersRef.current.add(timer)
+
+    const settle = (outcome: string) => {
+      clearTimeout(timer)
+      stuckCallTimersRef.current.delete(timer)
+      debugGadget(`call ${outcome}`, { method: property, generation, tookMs: Date.now() - issuedAt })
+    }
+    try {
+      Promise.resolve(result).then(() => settle('settled'), () => settle('rejected'))
+    } catch {
+      settle('threw')
+    }
+    return result
+  }
+
+  // A connection that answers nothing. Unlike a broken one it announces nothing either, so the only
+  // way out is the one the user found by hand: rebuild the frame. A redirect alone cannot help --
+  // the frame's already-issued calls are attached to the dead stub and no replacement can answer
+  // them -- so this reloads, which re-runs the gadget's init against a healthy connection. Bounded
+  // by the same ladder as a broken stub, so a persistently dead backend ends in a visible error
+  // rather than a reload loop.
+  const handleStuckConnection = () => {
+    if (recoveryTimerRef.current !== undefined) return
+    if (Date.now() - connectionSettledAtRef.current >= STUB_RECOVERY_STABLE_MS) {
+      recoveryAttemptsRef.current = 0
+    }
+    if (recoveryAttemptsRef.current >= STUB_RECOVERY_ATTEMPTS) {
+      console.error('Gadget connection kept failing to answer; giving up after',
+        STUB_RECOVERY_ATTEMPTS, 'attempts.')
+      setError('This gadget stopped responding.')
+      return
+    }
+    const delay = STUB_RECOVERY_BASE_MS * 2 ** recoveryAttemptsRef.current++
+    recoveryTimerRef.current = setTimeout(() => {
+      recoveryTimerRef.current = undefined
+      reloadIframe(new Error('Gadget connection stopped answering.'))
+    }, delay)
+  }
+
   const handleStubBroken = () => {
     suspendGadgetCalls()
     if (recoveryTimerRef.current !== undefined) return  // a recovery is already scheduled
@@ -337,6 +420,8 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
 
   const resetConnection = (reason: unknown) => {
     ++connectionGenerationRef.current
+    for (const timer of stuckCallTimersRef.current) clearTimeout(timer)
+    stuckCallTimersRef.current.clear()
     handshakePendingRef.current = null
     pendingGadgetStubRef.current?.reject(reason)
     pendingGadgetStubRef.current = null
@@ -686,9 +771,12 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
                 return Reflect.get(target, property, receiver)
               }
               const pending = pendingGadgetStubRef.current
-              return pending
-                ? (...args: any[]) => pending.promise.then(stub => stub[property](...args))
-                : gadgetStubRef.current[property]
+              if (pending) {
+                return (...args: any[]) => watchForwardedCall(
+                  pending.promise.then(stub => stub[property](...args)), property)
+              }
+              const stub = gadgetStubRef.current
+              return (...args: any[]) => watchForwardedCall(stub[property](...args), property)
             },
           })
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)

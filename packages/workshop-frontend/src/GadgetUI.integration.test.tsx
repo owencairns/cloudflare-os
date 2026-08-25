@@ -926,4 +926,98 @@ describe('GadgetUI RPC recovery', () => {
     const child = connectIframe(container.querySelector('iframe')!)
     await expect(child.read()).resolves.toBe('healthy')
   }, 40_000)
+
+  // ── a connection that answers nothing ─────────────────────────────────────────
+  //
+  // The failure prod actually showed, once the other symptoms were stripped away: the frame is
+  // alive, its bundle ran, its session is established -- and its very first RPC never settles.
+  // `pnpm os-client rpc <ws> list` answers the same gadget instantly from Node, so nothing is wrong
+  // with the server, the DO, or the protocol. Only the browser's connection is dead.
+  //
+  // It is dead in the one way nothing here could see. A pipelined `connectToGadget` whose stub is
+  // disposed mid-flight is *cancelled*, and a cancelled call neither settles nor fires
+  // `onRpcBroken`. What gets installed is a zombie: it accepts calls and answers none, behind a
+  // perfectly live session. Every guard was watching the wrong thing -- the watchdog asked "is
+  // there a session?" (yes), the recovery ladder waited for `onRpcBroken` (never came), and the
+  // suspension gate was never raised because nothing knew anything was wrong. Blank, silent, and
+  // consistent across reloads, exactly as reported.
+
+  /** A stub that accepts every call and settles none, and never reports itself broken. */
+  function zombieConnection(): RpcStub<TestGadget> {
+    const base: Record<string | symbol, unknown> = {
+      onRpcBroken: () => {},          // registered, never fires -- that is the whole problem
+      [Symbol.dispose]: () => {},
+    }
+    return new Proxy(base, {
+      get: (target, property) => {
+        // `then` must stay undefined or the stub is accidentally thenable, and `await`ing it hangs
+        // in `connectForHandshake` instead of installing it -- a different bug entirely, and one
+        // the handshake retry already handles. The zombie has to *install* cleanly and then
+        // swallow calls; that is what makes it invisible.
+        if (property === 'then') return undefined
+        return property in target ? target[property] : () => new Promise(() => {})
+      },
+    }) as unknown as RpcStub<TestGadget>
+  }
+
+  it('rebuilds the frame when its connection accepts calls but answers none', async () => {
+    const connectToGadget = vi.fn<() => Promise<RpcStub<TestGadget>>>()
+      .mockResolvedValueOnce(zombieConnection())
+      .mockResolvedValue(
+        new RpcStub(new TestGadgetTarget('healthy')) as unknown as RpcStub<TestGadget>,
+      )
+    const gadget = fakeGadget('gadget', 'document.body.textContent = "gadget"', connectToGadget)
+
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const firstIframe = container.querySelector('iframe')!
+    const child = connectIframe(firstIframe)
+
+    // The gadget's first call, exactly as Docs issues it before painting anything.
+    const firstCall = child.read()
+    void firstCall.catch(() => {})
+
+    // Nothing announces this failure, so only the unanswered call itself can reveal it. The frame
+    // must be rebuilt rather than left waiting forever.
+    await vi.waitFor(
+      () => expect(container.querySelector('iframe')).not.toBe(firstIframe),
+      { timeout: 25_000 },
+    )
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+
+    // The replacement frame re-runs the gadget's init against a working connection.
+    const reborn = connectIframe(container.querySelector('iframe')!)
+    await expect(reborn.read()).resolves.toBe('healthy')
+  }, 45_000)
+
+  it('does not mistake a slow gadget call for a dead connection', async () => {
+    // The guard measures silence, and a slow method is not silence forever. Rebuilding the frame
+    // under a method that was merely taking its time would be its own bug.
+    const slow = deferred<string>()
+    class SlowTarget extends RpcTarget {
+      read() { return slow.promise }
+    }
+    const connectToGadget = vi.fn<() => Promise<RpcStub<TestGadget>>>(
+      async () => new RpcStub(new SlowTarget()) as unknown as RpcStub<TestGadget>,
+    )
+    const gadget = fakeGadget('gadget', 'document.body.textContent = "gadget"', connectToGadget)
+
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+    const child = connectIframe(iframe)
+
+    const pending = child.read()
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+    slow.resolve('eventually')
+
+    await expect(pending).resolves.toBe('eventually')
+    expect(container.querySelector('iframe')).toBe(iframe)
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+    expect(connectToGadget).toHaveBeenCalledTimes(1)
+  }, 20_000)
 })
