@@ -848,4 +848,82 @@ describe('GadgetUI RPC recovery', () => {
     // Bounded: the ladder stops rather than reconnecting forever.
     expect(connectToGadget.mock.calls.length).toBeLessThanOrEqual(8)
   }, 30_000)
+
+  // ── no failure outlives the condition that caused it ──────────────────────────
+  //
+  // Every guard above ends in a visible error rather than a blank pane. That is only half the
+  // invariant: an error that persists after the backend recovers still needs a manual "Try again",
+  // which is a reload by another name. A replacement `gadget` is the evidence that the outage is
+  // over -- a reconnect, or a workspace reopened after a DO reset -- and neither of those fires
+  // onRpcBroken, so nothing else would ever clear it.
+
+  it('retries through a replacement gadget client after a failed handshake', async () => {
+    // Ported from upstream 882233d ("Reopen the workspace after a Durable Object reset"), whose
+    // useWorkspaceOpen half is not merged here.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const first = fakeGadget(
+        'first',
+        'document.body.textContent = "first"',
+        vi.fn<() => Promise<RpcStub<TestGadget>>>(async () => {
+          throw new Error('The execution context which hosts this callback is no longer running.')
+        }),
+      )
+      await act(async () => {
+        root.render(<GadgetUI gadget={first.stub} height="100px" />)
+      })
+      await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+      await act(async () => {
+        dispatchIframeHandshake(container.querySelector('iframe')!, new MessageChannel().port2)
+      })
+      await vi.waitFor(() => {
+        expect(container.querySelector('[data-testid="gadget-error"]')).not.toBeNull()
+      }, { timeout: 30_000 })
+      expect(container.querySelector('iframe')).toBeNull()
+
+      // The workspace reopened and produced a fresh client: the error must clear and the bundle
+      // reload on its own, with no manual "Try again".
+      const replacement = fakeGadget('replacement', 'document.body.textContent = "replacement"')
+      await act(async () => {
+        root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
+      })
+      await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+      expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+      expect(replacement.getUiBundle).toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  }, 60_000)
+
+  it('clears a give-up error once a working connection returns', async () => {
+    // The same property for the failure this component now produces on its own: the recovery
+    // ladder exhausting itself. A reconnect must undo it without user action, and must restore the
+    // full budget -- otherwise the next blip inherits an exhausted ladder.
+    const doomed = vi.fn<() => Promise<RpcStub<TestGadget>>>(async () => {
+      const connection = breakableConnection('doomed')
+      queueMicrotask(() => connection.break())
+      return connection.stub
+    })
+    const gadget = fakeGadget('gadget', 'document.body.textContent = "gadget"', doomed)
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    connectIframe(container.querySelector('iframe')!)
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="gadget-error"]')).not.toBeNull()
+    }, { timeout: 20_000 })
+
+    // The backend comes back and the editor hands over a fresh, healthy client.
+    const healthy = fakeGadget('healthy', 'document.body.textContent = "healthy"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={healthy.stub} height="100px" />)
+    })
+
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    expect(container.querySelector('[data-testid="gadget-error"]')).toBeNull()
+    const child = connectIframe(container.querySelector('iframe')!)
+    await expect(child.read()).resolves.toBe('healthy')
+  }, 40_000)
 })

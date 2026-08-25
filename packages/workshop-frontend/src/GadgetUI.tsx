@@ -280,6 +280,10 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   const onConsoleLogRef = useRef(onConsoleLog)
   onIframeEscapeRef.current = onIframeEscape
   onConsoleLogRef.current = onConsoleLog
+  // Read by the `[gadget, chatId]` effect, which must not depend on `error` -- depending on it
+  // would re-run the whole reconnect path every time an error is set or cleared.
+  const errorRef = useRef(error)
+  errorRef.current = error
 
   const suspendGadgetCalls = () => {
     if (!pendingGadgetStubRef.current) {
@@ -469,6 +473,32 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   // at most one redirect, and each redirect is itself superseded (not restarted) by generation.
   useEffect(() => {
     targetGenerationRef.current++
+
+    // A replacement client arrived while this frame was showing a failure. Every guard added above
+    // ends in a visible error rather than a blank pane -- but an error that outlives the condition
+    // causing it is just a blank pane with better manners, still needing a manual "Try again",
+    // which is a reload by another name. A fresh `gadget` is the evidence that the outage has
+    // passed (a reconnect, or a workspace reopened after a DO reset -- neither of which fires
+    // onRpcBroken), so retry through it automatically, with a full recovery budget.
+    //
+    // Checked before the session branches, not inside the "no session" one: this component can now
+    // fail *with* a live session too (the recovery ladder giving up holds a session whose stub is
+    // dead), and that failure needs clearing just as much. Reload rather than merely reset, so the
+    // replacement frame is guaranteed to handshake -- re-rendering identical srcDoc would leave
+    // the old frame in place holding a dead port.
+    //
+    // The no-session half is upstream's, from "Reopen the workspace after a Durable Object reset"
+    // (882233d), which is otherwise unmerged here.
+    if (errorRef.current !== null) {
+      recoveryAttemptsRef.current = 0
+      reloadIframe(new Error('Retrying with a replacement gadget client.'))
+      setError(null)
+      setHasLoaded(false)
+      setIsInvalidated(false)
+      setRetryNonce(n => n + 1)
+      return
+    }
+
     if (!rpcSessionRef.current) {
       if (handshakePendingRef.current !== null) suspendGadgetCalls()
       return
