@@ -187,8 +187,17 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   const [retryNonce, setRetryNonce] = useState(0)
   const connectionGenerationRef = useRef(0)
   const handshakePendingRef = useRef<number | null>(null)
+  // Identifies the newest (gadget, chatId) pair the component has been asked to talk to. The
+  // handshake handler samples it before its `connectToGadget` and compares afterwards: an
+  // unchanged token means the stub it just opened is still the right one, a changed token means
+  // the props moved on mid-handshake and the frame needs a redirect once it is connected. This is
+  // the whole damping mechanism -- it is read, never waited on, so churn can never restart the
+  // handshake.
+  const targetGenerationRef = useRef(0)
   const gadgetRef = useRef(gadget)
   gadgetRef.current = gadget
+  const chatIdRef = useRef(chatId)
+  chatIdRef.current = chatId
   // TODO: Remove `any` when Cap'n Web fixes cyclic type issues (RpcStub<any> triggers deep instantiation)
   const gadgetStubRef = useRef<any>(null)
   const pendingGadgetStubRef = useRef<{
@@ -268,40 +277,16 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     setIframeGeneration(generation => generation + 1)
   }
 
-  // DIAGNOSIS (unfixed): this is the prime suspect for the intermittent blank gadget iframe on a
-  // fresh navigation to /workspace/<id>, which a reload always clears.
-  //
-  // The branch below fires when `gadget` changes while a handshake is still in flight. It cannot
-  // reconnect (there is no session yet to redirect) and it must not let the handler finish, because
-  // the handler already called `connectToGadget` on the *previous* gadget -- so it throws the iframe
-  // away and starts over. The trouble is that starting over re-enters the same window: the fresh
-  // iframe posts a new handshake, and if `gadget` churns once more before that one settles, this
-  // branch fires again. The iframe is blank for as long as the churn lasts, and nothing here damps
-  // the loop -- it ends only when the props happen to go quiet.
-  //
-  // That matches every part of the repro. On a fresh navigation the stub is still settling as the
-  // editor wires up, so identity churn right after mount is exactly when it is likely; on reload the
-  // stub is stable before the iframe ever mounts, so the branch never runs. /gadget/<id> renders for
-  // the same reason: GadgetUseView passes a settled `gadget` and no `chatId` at all, while
-  // GadgetEditor passes both `chatId={previewChatId}` and a stub derived from the live overseer.
-  //
-  // The fix is NOT to drop the reload -- the staleness it guards against is real. It is to let the
-  // pending handshake complete and then run the redirect path below against it, i.e. treat "gadget
-  // changed mid-handshake" as a deferred reconnect rather than a restart. That reorders this
-  // component's connection lifecycle, so it wants a browser repro to verify rather than a blind
-  // edit, and it is deliberately left out of the theming change that touched this file.
-  useEffect(() => {
-    if (!rpcSessionRef.current) {
-      if (handshakePendingRef.current !== null) {
-        reloadIframe(new Error('Gadget changed during RPC handshake.'))
-      }
-      return
-    }
-
+  // Point the live RPC session at whatever `gadget`/`chatId` are current, without touching the
+  // iframe. Top-level calls are suspended on a promise until the replacement stub lands, so nothing
+  // reaches the outgoing stub in the meantime and nothing is dropped.
+  const redirectToCurrentGadget = () => {
     const generation = ++connectionGenerationRef.current
     const isCurrent = () => generation === connectionGenerationRef.current
     const pendingStub = suspendGadgetCalls()
-    const replacementPromise = Promise.resolve().then(() => gadget.connectToGadget(chatId))
+    const targetGadget = gadgetRef.current
+    const targetChatId = chatIdRef.current
+    const replacementPromise = Promise.resolve().then(() => targetGadget.connectToGadget(targetChatId))
     void replacementPromise.then(stub => {
       if (!isCurrent()) stub[Symbol.dispose]?.()
     }, () => {})
@@ -328,6 +313,38 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       }
     }
     void reconnect()
+  }
+
+  // React to `gadget`/`chatId` churn. There are exactly three states to be in, and none of them
+  // throws the iframe away:
+  //
+  //  1. A session is live -> redirect it at the new stub. The frame keeps painting throughout.
+  //  2. A handshake is in flight -> do NOT restart it. Raise the suspension gate now (so no call
+  //     can reach the about-to-be-installed stale stub) and record the churn by bumping the target
+  //     generation; the handshake handler sees the mismatch when its `connectToGadget` settles,
+  //     connects the frame anyway, and *then* redirects. Deferred reconnect, not a restart.
+  //  3. Nothing has handshaked yet -> nothing to do. The handler reads `gadgetRef`/`chatIdRef` at
+  //     handshake time, so it will pick up the newest props by itself.
+  //
+  // This is what fixes the intermittent blank iframe on a fresh navigation to /workspace/<id>. The
+  // old code took state 2 as "reload the iframe", which re-entered the same window: the replacement
+  // iframe posted a fresh handshake, and any further churn before it settled reloaded again. The
+  // frame stayed blank for as long as the churn lasted and nothing damped the loop -- and a fresh
+  // navigation is exactly when the stub is still settling, while a reload has a stable stub before
+  // the iframe ever mounts. The staleness that reload guarded against is real (the handler already
+  // called `connectToGadget` on the *previous* gadget), which is why the answer is to redirect the
+  // completed handshake rather than to drop the guard.
+  //
+  // Termination: churn only ever writes a ref here; nothing in this effect can cause an iframe
+  // remount, so no amount of churn can produce another handshake. Each handshake therefore ends in
+  // at most one redirect, and each redirect is itself superseded (not restarted) by generation.
+  useEffect(() => {
+    targetGenerationRef.current++
+    if (!rpcSessionRef.current) {
+      if (handshakePendingRef.current !== null) suspendGadgetCalls()
+      return
+    }
+    redirectToCurrentGadget()
   }, [gadget, chatId])
 
   // Effect to handle reloadTrigger changes (code changes)
@@ -435,14 +452,26 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         const isCurrent = () => !cancelled &&
           generation === connectionGenerationRef.current &&
           event.source === iframeRef.current?.contentWindow
+        // Sampled *before* the call so a `gadget`/`chatId` change that lands while it is in flight
+        // is detectable afterwards. This effect has no deps, so the refs -- not the closure -- are
+        // the only honest reading of the current props.
+        const targetGeneration = targetGenerationRef.current
         try {
           // Open the RPC connection to the gadget's server side
-          gadgetStub = await gadgetRef.current.connectToGadget(chatId)
+          gadgetStub = await gadgetRef.current.connectToGadget(chatIdRef.current)
           if (!isCurrent()) {
             gadgetStub[Symbol.dispose]?.()
             port.close()
             return
           }
+          // The props moved on while we were connecting, so this stub is already stale. Connect the
+          // frame with it anyway -- a frame that never gets a session is blank forever -- but raise
+          // the suspension gate first, so the forwarding target below queues every call onto the
+          // replacement instead of routing it to the stale stub. The redirect at the end of this
+          // block resolves that gate. The frame gets exactly one session, and exactly one settled
+          // connection behind it.
+          const isStale = targetGeneration !== targetGenerationRef.current
+          if (isStale) suspendGadgetCalls()
           installGadgetStub(gadgetStub)
           // Redirectable target: swapping gadgetStubRef reconnects top-level calls without reloading.
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
@@ -457,6 +486,13 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
             },
           })
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)
+          if (isStale) {
+            // Deferred reconnect: the frame is live, now point it at the current gadget. Clear the
+            // pending marker first so `resetConnection` inside the redirect path cannot mistake
+            // this finished handshake for one still in flight.
+            handshakePendingRef.current = null
+            redirectToCurrentGadget()
+          }
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
