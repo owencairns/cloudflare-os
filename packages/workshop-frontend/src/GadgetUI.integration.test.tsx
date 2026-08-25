@@ -430,7 +430,11 @@ describe('GadgetUI RPC recovery', () => {
     expect(container.querySelector('iframe')?.srcdoc).not.toContain('stale')
   })
 
-  it('disposes a connection that resolves after the gadget client is replaced', async () => {
+  // The regression that produced an intermittently blank gadget iframe on a fresh navigation. A
+  // `gadget` change during an in-flight handshake used to reload the iframe, which re-entered the
+  // same window and could loop for as long as the props churned. It must instead let the handshake
+  // finish and redirect it -- the frame is never thrown away, and the stale stub is never used.
+  it('keeps the iframe and redirects a handshake that was superseded mid-flight', async () => {
     const oldConnection = deferred<RpcStub<TestGadget>>()
     const first = fakeGadget(
       'first',
@@ -442,7 +446,7 @@ describe('GadgetUI RPC recovery', () => {
     })
     await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
     const firstIframe = container.querySelector('iframe')!
-    dispatchIframeHandshake(firstIframe, new MessageChannel().port2)
+    const child = connectIframe(firstIframe)
 
     const replacement = fakeGadget(
       'replacement',
@@ -451,7 +455,9 @@ describe('GadgetUI RPC recovery', () => {
     await act(async () => {
       root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
     })
-    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBe(firstIframe))
+    // No reload: the handshake is still pending, so the frame is left alone.
+    expect(container.querySelector('iframe')).toBe(firstIframe)
+    expect(replacement.connectToGadget).not.toHaveBeenCalled()
 
     const disposed = vi.fn<() => void>()
     await act(async () => {
@@ -460,10 +466,13 @@ describe('GadgetUI RPC recovery', () => {
       )
       await oldConnection.promise
     })
-    expect(disposed).toHaveBeenCalledOnce()
 
-    const replacementChild = connectIframe(container.querySelector('iframe')!)
-    await expect(replacementChild.read()).resolves.toBe('replacement')
+    // The superseded stub is connected but immediately redirected, so it is disposed unused and
+    // the frame ends up talking to the replacement over its original port.
+    await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce())
+    expect(replacement.connectToGadget).toHaveBeenCalledOnce()
+    expect(container.querySelector('iframe')).toBe(firstIframe)
+    await expect(child.read()).resolves.toBe('replacement')
   })
 
   it('ignores a handshake rejection from an iframe that was reloaded', async () => {
@@ -498,5 +507,129 @@ describe('GadgetUI RPC recovery', () => {
 
     const reloadedChild = connectIframe(container.querySelector('iframe')!)
     await expect(reloadedChild.read()).resolves.toBe('reloaded')
+  })
+
+  // ── adversarial `gadget` churn ────────────────────────────────────────────────
+  //
+  // The blank-iframe bug was a restart loop, so the interesting property is not "one churn is
+  // handled" but "arbitrary churn terminates". These drive far more prop churn than a real
+  // navigation would and assert the invariants that make the frame paint: exactly one iframe,
+  // never remounted; the frame always ends up with a live connection; and the amount of work is
+  // bounded rather than proportional to the churn.
+
+  const CHURN_ROUNDS = 25
+
+  it('damps a churn storm during the handshake into a single redirect', async () => {
+    const opening = deferred<RpcStub<TestGadget>>()
+    const first = fakeGadget('first', 'document.body.textContent = "first"', vi.fn(() => opening.promise))
+    await act(async () => {
+      root.render(<GadgetUI gadget={first.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+    const child = connectIframe(iframe)
+
+    // Churn the stub identity hard while the handshake is still in flight.
+    const churn = Array.from({ length: CHURN_ROUNDS }, (_, i) => fakeGadget(`churn-${i}`, 'unused'))
+    for (const next of churn) {
+      await act(async () => {
+        root.render(<GadgetUI gadget={next.stub} height="100px" />)
+      })
+      // The invariant that was violated before: the frame is never thrown away mid-handshake.
+      expect(container.querySelectorAll('iframe')).toHaveLength(1)
+      expect(container.querySelector('iframe')).toBe(iframe)
+    }
+    // No restart means no wasted connection attempts either -- every one of these would have been
+    // a fresh iframe plus a fresh handshake under the old behaviour.
+    for (const next of churn) expect(next.connectToGadget).not.toHaveBeenCalled()
+
+    const last = churn[churn.length - 1]
+    await act(async () => {
+      opening.resolve(new RpcStub(new TestGadgetTarget('stale')) as unknown as RpcStub<TestGadget>)
+      await opening.promise
+    })
+
+    // Bounded work: CHURN_ROUNDS changes collapse into exactly one reconnect, against the newest
+    // stub, and only the newest stub.
+    await vi.waitFor(() => expect(last.connectToGadget).toHaveBeenCalledOnce())
+    for (const next of churn.slice(0, -1)) expect(next.connectToGadget).not.toHaveBeenCalled()
+    expect(container.querySelectorAll('iframe')).toHaveLength(1)
+    expect(container.querySelector('iframe')).toBe(iframe)
+    await expect(child.read()).resolves.toBe(`churn-${CHURN_ROUNDS - 1}`)
+  })
+
+  it('keeps one live connection through churn that straddles the handshake', async () => {
+    const opening = deferred<RpcStub<TestGadget>>()
+    const first = fakeGadget('first', 'document.body.textContent = "first"', vi.fn(() => opening.promise))
+    await act(async () => {
+      root.render(<GadgetUI gadget={first.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+    const child = connectIframe(iframe)
+
+    // Half the churn lands before the handshake settles and half after, so the component has to
+    // cross from the "deferred reconnect" path to the "live redirect" path without dropping the
+    // frame or the calls riding on it.
+    const before = Array.from({ length: CHURN_ROUNDS }, (_, i) => fakeGadget(`before-${i}`, 'unused'))
+    for (const next of before) {
+      await act(async () => root.render(<GadgetUI gadget={next.stub} height="100px" />))
+    }
+
+    // A call issued while everything is in flight must still be answered -- by the settled
+    // connection, never by a stale stub and never by a promise that hangs.
+    const inFlight = child.read()
+
+    await act(async () => {
+      opening.resolve(new RpcStub(new TestGadgetTarget('stale')) as unknown as RpcStub<TestGadget>)
+      await opening.promise
+    })
+
+    const after = Array.from({ length: CHURN_ROUNDS }, (_, i) => fakeGadget(`after-${i}`, 'unused'))
+    for (const next of after) {
+      await act(async () => root.render(<GadgetUI gadget={next.stub} height="100px" />))
+      expect(container.querySelector('iframe')).toBe(iframe)
+    }
+
+    const final = `after-${CHURN_ROUNDS - 1}`
+    await vi.waitFor(() => expect(after[after.length - 1].connectToGadget).toHaveBeenCalledOnce())
+    await expect(inFlight).resolves.toBeTypeOf('string')
+    await expect(child.read()).resolves.toBe(final)
+    expect(container.querySelectorAll('iframe')).toHaveLength(1)
+    expect(container.querySelector('iframe')).toBe(iframe)
+    // Every redirect connects at most once, so the churn never compounds.
+    for (const next of after) expect(next.connectToGadget).toHaveBeenCalledTimes(1)
+  })
+
+  it('reconnects a code reload that lands together with gadget churn', async () => {
+    // The "a page already open when a code:write lands stays blank" repro: the new code invalidates
+    // the bundle and remounts the iframe, while the editor re-derives the gadget stub at the same
+    // moment. The replacement frame has to end up connected, not blank.
+    const first = fakeGadget('first', 'document.body.textContent = "first"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={first.stub} height="100px" reloadTrigger={0} />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+    const child = connectIframe(iframe)
+    await expect(child.read()).resolves.toBe('first')
+
+    for (let round = 1; round <= 5; round++) {
+      const written = fakeGadget(`written-${round}`, `document.body.textContent = "v${round}"`)
+      const churned = fakeGadget(`churned-${round}`, `document.body.textContent = "v${round}"`)
+      await act(async () => {
+        root.render(<GadgetUI gadget={written.stub} height="100px" reloadTrigger={round} />)
+      })
+      // ...and the stub identity churns while the reloaded frame is still handshaking.
+      await act(async () => {
+        root.render(<GadgetUI gadget={churned.stub} height="100px" reloadTrigger={round} />)
+      })
+      await vi.waitFor(() => {
+        expect(container.querySelector('iframe')?.srcdoc).toContain(`v${round}`)
+      })
+      expect(container.querySelectorAll('iframe')).toHaveLength(1)
+      const reloaded = connectIframe(container.querySelector('iframe')!)
+      await expect(reloaded.read()).resolves.toBe(`churned-${round}`)
+    }
   })
 })
