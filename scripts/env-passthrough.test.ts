@@ -73,12 +73,30 @@ const EXPECTED: Record<string, ExpectedArea> = {
   scripts: {
     forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
     external: [
-      "CF_ACCESS_AUD", "CF_ACCESS_ISS", "CF_AI_GATEWAY", "CF_AI_GATEWAY_ACCOUNT_ID",
-      "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_USE_BINDING",
-      "CI_COMMIT_SHA", "CI_PIPELINE_IID", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
-      "GITHUB_REPOSITORY", "GITHUB_TOKEN", "OS_PASSWORD", "OS_TOKEN", "OS_URL",
-      "PREVIEW_ADMINS", "PREVIEW_NAME",
-      "PREVIEW_PR_NUMBER", "PREVIEW_WORKERS_DEV_HOST", "PREVIEW_WRANGLER", "VITE_BACKEND_HOST",
+      "CF_ACCESS_AUD",
+      "CF_ACCESS_ISS",
+      "CF_AI_GATEWAY",
+      "CF_AI_GATEWAY_ACCOUNT_ID",
+      "CF_AI_GATEWAY_API_TOKEN",
+      "CF_AI_GATEWAY_PROVIDERS",
+      "CF_AI_GATEWAY_USE_BINDING",
+      "CI_COMMIT_SHA",
+      "CI_PIPELINE_IID",
+      "CLOUDFLARE_ACCOUNT_ID",
+      "CLOUDFLARE_API_TOKEN",
+      "GITHUB_REPOSITORY",
+      "GITHUB_TOKEN",
+      "OS_FEEDBACK_BLUEPRINT_ID",
+      "OS_FEEDBACK_WORKSPACE_ID",
+      "OS_PASSWORD",
+      "OS_TOKEN",
+      "OS_URL",
+      "PREVIEW_ADMINS",
+      "PREVIEW_NAME",
+      "PREVIEW_PR_NUMBER",
+      "PREVIEW_WORKERS_DEV_HOST",
+      "PREVIEW_WRANGLER",
+      "VITE_BACKEND_HOST",
     ],
   },
 };
@@ -104,8 +122,7 @@ const READ_PATTERNS = [
   /\.(VITE_[A-Z0-9_]+)/g,
   new RegExp(String.raw`(?:${ENV_OBJECTS})\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]`, "g"),
 ];
-const DESTRUCTURE_PATTERN =
-  new RegExp(String.raw`\{([^{}]*)\}\s*=\s*(?:${ENV_OBJECTS})`, "g");
+const DESTRUCTURE_PATTERN = new RegExp(String.raw`\{([^{}]*)\}\s*=\s*(?:${ENV_OBJECTS})`, "g");
 
 function sourceFiles(directory: string): string[] {
   const out: string[] = [];
@@ -156,7 +173,7 @@ const stripComments = (source: string) =>
 function declarationsIn(directory: string): { patterns: Set<string>; hasUncachedTask: boolean } {
   const patterns = new Set<string>();
   let hasUncachedTask = false;
-  for (const file of readdirSync(directory).filter(name => /^vite.*\.config\.ts$/.test(name))) {
+  for (const file of readdirSync(directory).filter((name) => /^vite.*\.config\.ts$/.test(name))) {
     const source = stripComments(readFileSync(join(directory, file), "utf8"));
     if (/cache:\s*false/.test(source)) hasUncachedTask = true;
     for (const block of source.matchAll(/env:\s*\[([^\]]*)\]/g)) {
@@ -167,15 +184,22 @@ function declarationsIn(directory: string): { patterns: Set<string>; hasUncached
 }
 
 const matches = (name: string, pattern: string) =>
-  new RegExp(`^${pattern.split("*").map(part => part.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`)
-    .test(name);
+  new RegExp(
+    `^${pattern
+      .split("*")
+      .map((part) => part.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*")}$`,
+  ).test(name);
 
 describe("build-time env passthrough", () => {
   // These double as the keys compared against EXPECTED, so they are built with `/` rather than
   // `join`, whose separator is platform-dependent. Forward slashes still resolve as paths on Windows.
-  const areas = ["scripts", ...readdirSync("packages", { withFileTypes: true })
-    .filter(entry => entry.isDirectory())
-    .map(entry => `packages/${entry.name}`)];
+  const areas = [
+    "scripts",
+    ...readdirSync("packages", { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => `packages/${entry.name}`),
+  ];
 
   it("uses only known categories", () => {
     for (const [area, groups] of Object.entries(EXPECTED)) {
@@ -184,7 +208,8 @@ describe("build-time env passthrough", () => {
           CATEGORIES.has(category),
           `${area} uses unknown category "${category}" in EXPECTED. Known: ` +
             `${[...CATEGORIES].join(", ")}. A misspelled category still balances the accounting ` +
-            "assertion, so its variables would go unchecked.");
+            "assertion, so its variables would go unchecked.",
+        );
       }
     }
   });
@@ -192,21 +217,25 @@ describe("build-time env passthrough", () => {
   it("accounts for every build-time env read in the workspace", () => {
     const discovered = Object.fromEntries(
       areas
-        .filter(area => statSync(area).isDirectory())
-        .map(area => [area, [...readsUnder(area)].toSorted()])
-        .filter(([, names]) => names.length > 0));
+        .filter((area) => statSync(area).isDirectory())
+        .map((area) => [area, [...readsUnder(area)].toSorted()])
+        .filter(([, names]) => names.length > 0),
+    );
 
     const expected = Object.fromEntries(
       Object.entries(EXPECTED).map(([area, groups]) => [
         area,
         Object.values(groups).flat().toSorted(),
-      ]));
+      ]),
+    );
 
     assert.deepEqual(
-      discovered, expected,
+      discovered,
+      expected,
       "the build-time env surface changed. Add each new variable to EXPECTED in this file under " +
         "the category describing how it reaches the build — and if that category is `forwarded`, " +
-        "add it to the task's `env` too, or a cached run will silently drop it.");
+        "add it to the task's `env` too, or a cached run will silently drop it.",
+    );
   });
 
   it("declares every forwarded variable on the task that reads it", () => {
@@ -217,9 +246,10 @@ describe("build-time env passthrough", () => {
       const { patterns } = declarationsIn(area);
       for (const name of groups.forwarded ?? []) {
         assert.ok(
-          [...patterns].some(pattern => matches(name, pattern)),
+          [...patterns].some((pattern) => matches(name, pattern)),
           `${area} reads ${name} at build time but no task there declares it in \`env\` ` +
-            `(declared: ${[...patterns].toSorted().join(", ") || "none"}). A cached run drops it.`);
+            `(declared: ${[...patterns].toSorted().join(", ") || "none"}). A cached run drops it.`,
+        );
       }
     }
   });
@@ -230,7 +260,8 @@ describe("build-time env passthrough", () => {
       assert.ok(
         declarationsIn(area).hasUncachedTask,
         `${area} relies on an uncached task to receive ${groups.uncached.join(", ")}, but no task ` +
-          "there sets `cache: false`. Either declare the variables in `env` or restore `cache: false`.");
+          "there sets `cache: false`. Either declare the variables in `env` or restore `cache: false`.",
+      );
     }
   });
 });

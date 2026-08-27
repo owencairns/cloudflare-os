@@ -21,9 +21,11 @@ loadDotEnv();
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const GADGETS_DIR = join(ROOT, "gadgets");
 
-// The Tasks workspace predates multi-gadget support, so its gadget index is 0.
+// First-party gadget roster. Feedback is provisioned per MyoPlan OS environment, so its live
+// workspace id is operator configuration rather than a credential or a fabricated repository id.
 const GADGETS: { name: string; wsId: string }[] = [
   { name: "tasks", wsId: "8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564" },
+  { name: "feedback", wsId: process.env.OS_FEEDBACK_WORKSPACE_ID ?? "" },
 ];
 
 interface RemoteFiles {
@@ -54,7 +56,9 @@ async function fetchGadgetSource(wsId: string): Promise<RemoteFiles> {
 
 // Duplicated (not imported) from os-client/commands.ts: that helper isn't exported, and pulling
 // in the whole subscription dance import surface here isn't worth it for one call site.
-async function listWorkpieces(overseer: unknown): Promise<{ id: number; commitId: string | null }[]> {
+async function listWorkpieces(
+  overseer: unknown,
+): Promise<{ id: number; commitId: string | null }[]> {
   const { RpcStub, RpcTarget } = await import("capnweb");
   const entries: { id: number; commitId: string | null }[] = [];
   let resolveReady: () => void;
@@ -117,11 +121,17 @@ function diffSummary(local: Map<string, string>, remote: [string, string][]): st
 async function pull(gadgetFilter?: string): Promise<void> {
   const targets = gadgetFilter ? GADGETS.filter((g) => g.name === gadgetFilter) : GADGETS;
   if (gadgetFilter && targets.length === 0) {
-    throw new Error(`Unknown gadget "${gadgetFilter}". Known: ${GADGETS.map((g) => g.name).join(", ")}`);
+    throw new Error(
+      `Unknown gadget "${gadgetFilter}". Known: ${GADGETS.map((g) => g.name).join(", ")}`,
+    );
   }
 
   for (const { name, wsId } of targets) {
     console.log(`\n=== ${name} ===`);
+    if (!wsId) {
+      console.log("  (not configured -- set OS_FEEDBACK_WORKSPACE_ID after provisioning)");
+      continue;
+    }
     const before = localFiles(name);
     const { commitId, files } = await fetchGadgetSource(wsId);
     if (!commitId) {
@@ -148,6 +158,10 @@ async function pull(gadgetFilter?: string): Promise<void> {
 async function check(): Promise<void> {
   let drifted = false;
   for (const { name, wsId } of GADGETS) {
+    if (!wsId) {
+      console.log(`${name}: not configured (set OS_FEEDBACK_WORKSPACE_ID after provisioning)`);
+      continue;
+    }
     const before = localFiles(name);
     const { commitId, files } = await fetchGadgetSource(wsId);
     if (!commitId) {
@@ -164,7 +178,9 @@ async function check(): Promise<void> {
     }
   }
   if (drifted) {
-    console.error("\ngadgets/ is out of sync with prod. Run `pnpm os-gadget pull` to update the repo,");
+    console.error(
+      "\ngadgets/ is out of sync with prod. Run `pnpm os-gadget pull` to update the repo,",
+    );
     console.error("or publish local changes via code:write / code:merge / blueprint:publish.");
     process.exit(1);
   }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Backup / restore for the first-party MyoPlan OS Tasks gadget.
+// Backup / restore for the first-party MyoPlan OS source-of-record gadgets.
 //
 // Every gadget keeps its company data in its own Durable Object's SQLite storage, which has no
 // export, no snapshot, and no recovery path of its own. Each gadget's server.js exposes
@@ -28,6 +28,8 @@ import type { AuthenticatedApi, Overseer } from "@gadgets/workshop-shared/api";
 import { connectAuthenticated, disposeQuietly, getOsUrl } from "../os-client/client.ts";
 import { loadDotEnv } from "../os-client/env.ts";
 
+loadDotEnv();
+
 // ---------------------------------------------------------------------------------------------
 // the gadget roster
 // ---------------------------------------------------------------------------------------------
@@ -55,6 +57,11 @@ const GADGETS: GadgetSpec[] = [
     workspaceId: "8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564",
     blueprintId: "71826818ade38c9bfe78705e53ea334c",
   },
+  {
+    name: "feedback",
+    workspaceId: process.env.OS_FEEDBACK_WORKSPACE_ID ?? "",
+    blueprintId: process.env.OS_FEEDBACK_BLUEPRINT_ID ?? "",
+  },
 ];
 
 /** The established first-party workspaces predate multi-gadget support and use gadget 0. */
@@ -79,7 +86,9 @@ function validateSnapshot(value: unknown, expectedGadget?: string): Snapshot {
     throw bad(`it is for gadget '${snapshot.gadget}', not '${expectedGadget}'.`);
   }
   if (snapshot.schemaVersion !== SCHEMA_VERSION) {
-    throw bad(`unsupported schemaVersion ${JSON.stringify(snapshot.schemaVersion)} (expected ${SCHEMA_VERSION}).`);
+    throw bad(
+      `unsupported schemaVersion ${JSON.stringify(snapshot.schemaVersion)} (expected ${SCHEMA_VERSION}).`,
+    );
   }
   if (typeof snapshot.exportedAt !== "string" || Number.isNaN(Date.parse(snapshot.exportedAt))) {
     throw bad("`exportedAt` is missing or not an ISO timestamp.");
@@ -92,7 +101,9 @@ function validateSnapshot(value: unknown, expectedGadget?: string): Snapshot {
   for (const [table, rows] of Object.entries(data)) {
     if (!Array.isArray(rows)) throw bad(`data.${table} is not an array.`);
     if (counts[table] !== rows.length) {
-      throw bad(`counts.${table} says ${String(counts[table])} but data.${table} has ${rows.length} rows.`);
+      throw bad(
+        `counts.${table} says ${String(counts[table])} but data.${table} has ${rows.length} rows.`,
+      );
     }
     for (const [i, row] of rows.entries()) {
       if (!row || typeof row !== "object" || Array.isArray(row)) {
@@ -101,7 +112,8 @@ function validateSnapshot(value: unknown, expectedGadget?: string): Snapshot {
     }
   }
   for (const table of Object.keys(counts)) {
-    if (!(table in data)) throw bad(`counts mentions table '${table}' that data has no rows array for.`);
+    if (!(table in data))
+      throw bad(`counts mentions table '${table}' that data has no rows array for.`);
   }
   return snapshot as Snapshot;
 }
@@ -144,7 +156,11 @@ async function withGadget<T>(
 }
 
 async function exportGadget(auth: RpcStub<AuthenticatedApi>, spec: GadgetSpec): Promise<Snapshot> {
-  const raw = await withGadget(auth, spec.workspaceId, (gadget) => gadget.exportAll() as Promise<unknown>);
+  const raw = await withGadget(
+    auth,
+    spec.workspaceId,
+    (gadget) => gadget.exportAll() as Promise<unknown>,
+  );
   return validateSnapshot(raw, spec.name);
 }
 
@@ -174,6 +190,16 @@ function defaultOutDir(): string {
 }
 
 async function runBackup(specs: GadgetSpec[], outDir: string, verify: boolean): Promise<void> {
+  const missing = specs.filter((spec) => !spec.workspaceId);
+  if (missing.length) {
+    throw new Error(
+      `Missing workspace configuration for ${missing.map((spec) => spec.name).join(", ")}. ` +
+        "Set OS_FEEDBACK_WORKSPACE_ID after provisioning, or select a configured gadget with --gadget.",
+    );
+  }
+  if (verify && specs.some((spec) => !spec.blueprintId)) {
+    throw new Error("--verify requires OS_FEEDBACK_BLUEPRINT_ID for Feedback.");
+  }
   mkdirSync(outDir, { recursive: true });
   const { pub, auth } = await connectAuthenticated();
   try {
@@ -189,7 +215,9 @@ async function runBackup(specs: GadgetSpec[], outDir: string, verify: boolean): 
       const counts = Object.entries(snapshot.counts)
         .map(([table, n]) => `${table}=${n}`)
         .join(" ");
-      console.log(`  ${spec.name.padEnd(7)} ${String(totalRows(snapshot)).padStart(5)} rows  ${formatBytes(bytes).padStart(9)}  ${counts}`);
+      console.log(
+        `  ${spec.name.padEnd(7)} ${String(totalRows(snapshot)).padStart(5)} rows  ${formatBytes(bytes).padStart(9)}  ${counts}`,
+      );
     }
 
     const totalBytes = written.reduce((sum, w) => sum + w.bytes, 0);
@@ -237,9 +265,13 @@ async function verifyRoundTrip(
     }
 
     const result = await importGadget(
-      auth, scratchId, snapshot, "replace", metadata.defaultGadgetId);
-    const restored = await exportByWorkspace(
-      auth, scratchId, spec.name, metadata.defaultGadgetId);
+      auth,
+      scratchId,
+      snapshot,
+      "replace",
+      metadata.defaultGadgetId,
+    );
+    const restored = await exportByWorkspace(auth, scratchId, spec.name, metadata.defaultGadgetId);
     const before = JSON.stringify(snapshot.data);
     const after = JSON.stringify(restored.data);
     if (before !== after) {
@@ -272,7 +304,11 @@ async function exportByWorkspace(
   gadgetId: number,
 ): Promise<Snapshot> {
   const raw = await withGadget(
-    auth, workspaceId, (gadget) => gadget.exportAll() as Promise<unknown>, gadgetId);
+    auth,
+    workspaceId,
+    (gadget) => gadget.exportAll() as Promise<unknown>,
+    gadgetId,
+  );
   return validateSnapshot(raw, expectedGadget);
 }
 
@@ -294,7 +330,9 @@ async function runRestore(spec: GadgetSpec, dir: string, mode: "replace" | "merg
     const after = await exportGadget(auth, spec);
     console.log(
       `  imported=${result.imported} skipped=${result.skipped}\n` +
-        `  live gadget now holds ${totalRows(after)} rows (${Object.entries(after.counts).map(([t, n]) => `${t}=${n}`).join(" ")})`,
+        `  live gadget now holds ${totalRows(after)} rows (${Object.entries(after.counts)
+          .map(([t, n]) => `${t}=${n}`)
+          .join(" ")})`,
     );
   } finally {
     disposeQuietly(pub);
@@ -348,7 +386,8 @@ function parseArgs(argv: string[]): Record<string, string | true> {
 
 function gadgetNamed(name: string): GadgetSpec {
   const spec = GADGETS.find((g) => g.name === name);
-  if (!spec) throw new Error(`Unknown gadget '${name}'. Known: ${GADGETS.map((g) => g.name).join(", ")}.`);
+  if (!spec)
+    throw new Error(`Unknown gadget '${name}'. Known: ${GADGETS.map((g) => g.name).join(", ")}.`);
   return spec;
 }
 
@@ -365,13 +404,19 @@ async function main(): Promise<void> {
   if (typeof flags.restore === "string") {
     if (!gadgetFlag) throw new Error("--restore requires --gadget <name>.");
     const mode = flags.mode === undefined ? "merge" : String(flags.mode);
-    if (mode !== "replace" && mode !== "merge") throw new Error("--mode must be 'replace' or 'merge'.");
+    if (mode !== "replace" && mode !== "merge")
+      throw new Error("--mode must be 'replace' or 'merge'.");
     await runRestore(gadgetNamed(gadgetFlag), flags.restore, mode);
     return;
   }
   if (flags.restore === true) throw new Error("--restore requires a directory.");
 
-  const specs = gadgetFlag ? [gadgetNamed(gadgetFlag)] : GADGETS;
+  const configured = GADGETS.filter((spec) => spec.workspaceId);
+  if (!gadgetFlag && configured.length !== GADGETS.length) {
+    const skipped = GADGETS.filter((spec) => !spec.workspaceId).map((spec) => spec.name);
+    console.warn(`Skipping unconfigured gadget(s): ${skipped.join(", ")}.`);
+  }
+  const specs = gadgetFlag ? [gadgetNamed(gadgetFlag)] : configured;
   const outDir = typeof flags.out === "string" ? resolve(flags.out) : defaultOutDir();
   await runBackup(specs, outDir, flags.verify === true);
 }
