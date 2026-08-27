@@ -1,6 +1,6 @@
 # First-party gadgets (source of record)
 
-This directory vendors the source of the first-party **Tasks** gadget running on the
+This directory vendors the source of the first-party **Tasks** and **Feedback** gadgets running on the
 live **MyoPlan OS** instance at `https://os.myoplan.app`. Durable company knowledge
 lives in the platform's ambient **Context** gatekeeper, not in a gadget.
 
@@ -15,9 +15,10 @@ users actually talk to — but it should always match what's committed here.
 
 ## Workspace / gadget / blueprint ids
 
-| Gadget | Workspace id | Gadget id (workpiece index) | Blueprint |
-|---|---|---|---|
-| Tasks | `8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564` | `0` | see `blueprint:publish` output / `outputs:list` |
+| Gadget   | Workspace id                                                       | Gadget id (workpiece index) | Blueprint                                       |
+| -------- | ------------------------------------------------------------------ | --------------------------- | ----------------------------------------------- |
+| Tasks    | `8d78489817bacda4e4b178de65e0f1ac50eded843b0e23e4c702c1d4a6aed564` | `0`                         | see `blueprint:publish` output / `outputs:list` |
+| Feedback | set with `OS_FEEDBACK_WORKSPACE_ID` after provisioning             | `0`                         | set with `OS_FEEDBACK_BLUEPRINT_ID`             |
 
 These ids are stable identifiers for the live workspaces; keep this table in sync if
 any gadget is ever recreated under a new workspace.
@@ -30,7 +31,7 @@ runtime:
 - **`server.js`** — a Durable Object class. Every method that's exported as public on
   the class is RPC-callable both from `client.js` (the UI) and from external agents
   (via `pnpm os-client rpc <wsId> <method> [jsonArgs...]`, or the platform's own
-  agent-facing surfaces). There is no separate "API layer" — the DO class *is* the
+  agent-facing surfaces). There is no separate "API layer" — the DO class _is_ the
   API.
   - Storage is `ctx.storage.sql` (SQLite in the Durable Object). No KV, no external
     database.
@@ -89,7 +90,7 @@ hardcode `chatId`. Instead:
 `scripts/os-gadget-sync.ts` (wired up as `pnpm os-gadget`) automates the read side
 of the above:
 
-- `pnpm os-gadget pull` — fetch current prod source for the Tasks gadget into
+- `pnpm os-gadget pull` — fetch current prod source for every configured first-party gadget into
   `gadgets/<name>/`, and print a diff summary against what was already on disk (or
   `pnpm os-gadget pull --gadget tasks` for just one).
 - `pnpm os-gadget check` — fetch prod and assert it matches the repo byte-for-byte;
